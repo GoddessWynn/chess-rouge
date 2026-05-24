@@ -1,0 +1,85 @@
+import "core:ao"
+
+// Game wide systems
+ao_before_scene_load :: proc() {
+    // Called before the scene is loaded (economy registration etc...)
+}
+
+ao_start :: proc() {
+}
+
+ao_update :: proc(dt: float) {
+}
+
+ao_late_update :: proc(dt: float) {
+}
+
+// Per player state
+Player :: class : Player_Base {
+    is_controlling: bool;
+    pos_offset: float;
+
+    ao_start :: method() {
+    }
+
+    ao_update :: method(dt: float) {
+    }
+
+    ao_late_update :: method(dt: float) {
+        if is_local() {
+            screen := UI.get_safe_screen_rect();
+
+            standing_text_rect := screen.top_center_rect().offset(0, -100);
+            standing_text_ts := UI.default_text_settings();
+            standing_text_ts.size = 52;
+            standing_text_ts.color = {1, 1, 1, 1};
+            standing_text_ts.halign = .CENTER;
+            standing_text_ts.valign = .CENTER;
+            
+            standing_text := "Not on board";
+            if is_on_chess_board() {
+                standing_text = "On board";
+                if is_controlling {
+                    standing_text_ts.color = {0, 1, 0, 1};
+                }
+            } else {
+                standing_text = "Not on board";
+                if is_controlling {
+                    standing_text_ts.color = {1, 0, 0, 1};
+                }
+            }
+            UI.text(standing_text_rect, standing_text_ts, standing_text);
+        }
+    }
+
+    is_on_chess_board :: method() -> bool {
+        board_entity := Scene.get_entity_by_name("Chess Board");
+        if board_entity == null {
+            return false;
+        }
+
+        delta := entity.world_position - board_entity.world_position;
+        delta.y += pos_offset;
+        log("Delta to board: %", {delta});
+        return abs(delta.x) <= 4.5 && abs(delta.y) <= 4.5;
+    }
+
+    ao_end :: method() {
+        // On destroy
+    }
+
+    ao_can_use_ability :: method(ability: Ability_Base) -> bool {
+        // Global ability callback for example don't allow use when dead
+        return true;
+    }
+
+    ao_can_use_interactable :: method(interactable: Interactable) -> bool {
+        // Global interactable callback
+        return true;
+    }
+
+    ao_on_state_sync :: method() {
+        // Called on the client after applying a state sync from the server
+        // Use this to override things for the local player only like name colors or lighting for example
+    }
+}
