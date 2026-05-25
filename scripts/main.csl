@@ -1,5 +1,33 @@
 import "core:ao"
 
+current_turn_is_white: bool = true;
+
+get_turn_name :: proc() -> string {
+    if current_turn_is_white {
+        return "White";
+    }
+    return "Black";
+}
+
+is_piece_turn :: proc(colour: string) -> bool {
+    if colour == "White" {
+        return current_turn_is_white;
+    }
+    return !current_turn_is_white;
+}
+
+end_turn :: proc() {
+    current_turn_is_white = !current_turn_is_white;
+}
+
+tp :: proc(player: Player, x: float = 0, y: float = 0) {
+    player.entity.set_local_position({x, y});
+    Notifier.notify(player, format_string("Teleported to (%, %)", {x, y}));
+} @chat_command
+tell_me :: proc(player: Player) {
+    Notifier.notify(player, format_string("You are in %", {player.which_chess_square()}));
+} @chat_command
+
 // Game wide systems
 ao_before_scene_load :: proc() {
     // Called before the scene is loaded (economy registration etc...)
@@ -18,18 +46,51 @@ ao_late_update :: proc(dt: float) {
 Player :: class : Player_Base {
     is_controlling: bool;
     pos_offset: float;
+    illegal_move_timer: float;
+    illegal_move_text: string;
 
     ao_start :: method() {
+        illegal_move_timer = 0;
+        illegal_move_text = "";
     }
 
     ao_update :: method(dt: float) {
+        if illegal_move_timer > 0 {
+            illegal_move_timer -= dt;
+            if illegal_move_timer <= 0 {
+                illegal_move_timer = 0;
+                illegal_move_text = "";
+            }
+        }
     }
 
     ao_late_update :: method(dt: float) {
         if is_local() {
             screen := UI.get_safe_screen_rect();
 
-            standing_text_rect := screen.top_center_rect().offset(0, -100);
+            turn_text_rect := screen.top_center_rect().offset(0, -40);
+            turn_text_ts := UI.default_text_settings();
+            turn_text_ts.size = 42;
+            if illegal_move_timer > 0 {
+                turn_text_ts.color = {1, 0, 0, 1};
+            } else {
+                turn_text_ts.color = {1, 1, 1, 1};
+            }
+            turn_text_ts.halign = .CENTER;
+            turn_text_ts.valign = .CENTER;
+            UI.text(turn_text_rect, turn_text_ts, format_string("% to move", {get_turn_name()}));
+
+            if illegal_move_timer > 0 {
+                illegal_text_rect := screen.top_center_rect().offset(0, -90);
+                illegal_text_ts := UI.default_text_settings();
+                illegal_text_ts.size = 38;
+                illegal_text_ts.color = {1, 0, 0, 1};
+                illegal_text_ts.halign = .CENTER;
+                illegal_text_ts.valign = .CENTER;
+                UI.text(illegal_text_rect, illegal_text_ts, illegal_move_text);
+            }
+
+            standing_text_rect := screen.top_center_rect().offset(0, -130);
             standing_text_ts := UI.default_text_settings();
             standing_text_ts.size = 52;
             standing_text_ts.color = {1, 1, 1, 1};
@@ -41,6 +102,7 @@ Player :: class : Player_Base {
                 standing_text = "On board";
                 if is_controlling {
                     standing_text_ts.color = {0, 1, 0, 1};
+                    standing_text = format_string("% (%)", {standing_text, which_chess_square()});
                 }
             } else {
                 standing_text = "Not on board";
@@ -60,8 +122,36 @@ Player :: class : Player_Base {
 
         delta := entity.world_position - board_entity.world_position;
         delta.y += pos_offset;
-        log("Delta to board: %", {delta});
-        return abs(delta.x) <= 4.5 && abs(delta.y) <= 4.5;
+        return abs(delta.x) <= 4.25 && abs(delta.y) <= 4.25;
+    }
+
+    which_chess_square :: method() -> string {
+        board_entity := Scene.get_entity_by_name("Chess Board");
+
+        delta := entity.world_position - board_entity.world_position;
+        delta.y += pos_offset;
+        chess_file := ((delta.x + 4.25) / (8.5 / 8)) + 1;
+        chess_rank := ((delta.y + 4.25) / (8.5 / 8)) + 1;
+        chess_square := "";
+        if chess_file > 0 && chess_file >= 1 && chess_file < 2 {
+            chess_square = format_string("A%", {chess_rank.(int)});
+        } else if chess_file > 1 && chess_file >= 2 && chess_file < 3 {
+            chess_square = format_string("B%", {chess_rank.(int)});
+        } else if chess_file > 2 && chess_file >= 3 && chess_file < 4 {
+            chess_square = format_string("C%", {chess_rank.(int)});
+        } else if chess_file > 3 && chess_file >= 4 && chess_file < 5 {
+            chess_square = format_string("D%", {chess_rank.(int)});
+        } else if chess_file > 4 && chess_file >= 5 && chess_file < 6 {
+            chess_square = format_string("E%", {chess_rank.(int)});
+        } else if chess_file > 5 && chess_file >= 6 && chess_file < 7 {
+            chess_square = format_string("F%", {chess_rank.(int)});
+        } else if chess_file > 6 && chess_file >= 7 && chess_file < 8 {
+            chess_square = format_string("G%", {chess_rank.(int)});
+        } else if chess_file > 7 && chess_file >= 8 && chess_file <= 9 {
+            chess_square = format_string("H%", {chess_rank.(int)});
+        }
+
+        return chess_square;
     }
 
     ao_end :: method() {

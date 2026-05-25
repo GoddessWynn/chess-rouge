@@ -5,6 +5,8 @@ Controllable_Entity :: class : Component {
 
     interactable: Interactable;
     movement_agent: Movement_Agent;
+    board_entity: Entity;
+    move_highlights: [..]Entity;
     square: string;
     pos_offset: float;
     controller: Player;
@@ -51,6 +53,7 @@ Controllable_Entity :: class : Component {
             movement_agent.movement_speed = 10.0;
         }
 
+        move_highlights.clear();
         update_prompt();
     }
 
@@ -67,6 +70,10 @@ Controllable_Entity :: class : Component {
             return;
         }
 
+        if piece == "Pawn" && !is_piece_turn(colour) {
+            return;
+        }
+
         controller = player;
         controller.entity.set_local_position({entity.local_position.x, entity.local_position.y - pos_offset});
         controller.pos_offset = pos_offset;
@@ -74,6 +81,10 @@ Controllable_Entity :: class : Component {
         controller.add_invisibility_reason(piece);
         controller.set_name_override(format_string("% (%)", {controller.get_username(), piece}));
         controller.is_controlling = true;
+
+        if piece == "Pawn" {
+            spawn_move_highlights();
+        }
 
         update_prompt();
     }
@@ -101,12 +112,43 @@ Controllable_Entity :: class : Component {
             return;
         }
 
+        if piece == "Pawn" {
+            piece_pos := entity.world_position;
+            found_move := false;
+            for highlight_entity: move_highlights {
+                if highlight_entity == null {
+                    continue;
+                }
+
+                dist := length(piece_pos - highlight_entity.world_position);
+                if dist <= 0.5 {
+                    highlight_comp := highlight_entity.get_component(Move_Highlight);
+                    if highlight_comp != null {
+                        found_move = true;
+                        controller.remove_invisibility_reason(piece);
+                        controller.set_name_override(format_string("%", {controller.get_username()}));
+                        controller.is_controlling = false;
+                        controller.pos_offset = 0;
+                        controller = null;
+                        highlight_comp.owner.perform_move(highlight_comp.target_file, highlight_comp.target_rank, highlight_comp.is_capture);
+                        return;
+                    }
+                }
+            }
+
+            if !found_move {
+                controller.illegal_move_timer = 1.5;
+                controller.illegal_move_text = "Illegal Move";
+            }
+        }
+
         controller.remove_invisibility_reason(piece);
         controller.set_name_override(format_string("%", {controller.get_username()}));
         controller.is_controlling = false;
         controller.pos_offset = 0;
 
         controller = null;
+        clear_move_highlights();
         update_prompt();
     }
 
@@ -123,6 +165,191 @@ Controllable_Entity :: class : Component {
         }
     }
 
+    clear_move_highlights :: method() {
+        for highlight: move_highlights {
+            if highlight != null {
+                highlight.destroy();
+            }
+        }
+        move_highlights.clear();
+    }
+
+    get_board_entity :: method() -> Entity {
+        if board_entity == null {
+            board_entity = Scene.get_entity_by_name("Chess Board");
+        }
+        return board_entity;
+    }
+
+    get_board_square_size :: method() -> float {
+        return 8.5 / 8.0;
+    }
+
+    get_board_file_rank :: method(file: ref int, rank: ref int) {
+        board_entity := get_board_entity();
+        if board_entity == null {
+            file = 0;
+            rank = 0;
+            return;
+        }
+
+        delta := entity.world_position - board_entity.world_position;
+        file = ((delta.x + 4.25) / get_board_square_size()).(int) + 1;
+        rank = ((delta.y + 4.25) / get_board_square_size()).(int) + 1;
+    }
+
+    is_square_inside_board :: method(file: int, rank: int) -> bool {
+        return file >= 1 && file <= 8 && rank >= 1 && rank <= 8;
+    }
+
+    world_position_for_square :: method(file: int, rank: int) -> v2 {
+        board_entity := get_board_entity();
+        if board_entity == null {
+            return {0, 0};
+        }
+
+        half_square := get_board_square_size() * 0.5;
+        x := board_entity.world_position.x + (-4.25 + (file - 1).(float) * get_board_square_size() + half_square);
+        y := board_entity.world_position.y + (-4.25 + (rank - 1).(float) * get_board_square_size() + half_square);
+        return {x, y};
+    }
+
+    find_piece_at :: method(file: int, rank: int) -> Controllable_Entity {
+        if !is_square_inside_board(file, rank) {
+            return null;
+        }
+
+        target_pos := world_position_for_square(file, rank);
+        for other: component_iterator(Controllable_Entity) {
+            if other == this {
+                continue;
+            }
+            if length(other.entity.world_position - target_pos) <= get_board_square_size() * 0.35 {
+                return other;
+            }
+        }
+
+        return null;
+    }
+
+    is_square_empty :: method(file: int, rank: int) -> bool {
+        if !is_square_inside_board(file, rank) {
+            return false;
+        }
+        return find_piece_at(file, rank) == null;
+    }
+
+    spawn_move_highlights :: method() {
+        clear_move_highlights();
+        if piece != "Pawn" {
+            return;
+        }
+
+        file := 0;
+        rank := 0;
+        get_board_file_rank(ref file, ref rank);
+        if !is_square_inside_board(file, rank) {
+            return;
+        }
+
+        forward := 1.(int);
+        starting_rank := 2.(int);
+        if colour == "Black" {
+            forward = -1;
+            starting_rank = 7;
+        }
+
+        one_rank := rank + forward;
+        if is_square_inside_board(file, one_rank) && is_square_empty(file, one_rank) {
+            add_move_highlight(file, one_rank, false);
+            if rank == starting_rank {
+                two_rank := rank + forward * 2.(int);
+                if is_square_inside_board(file, two_rank) && is_square_empty(file, two_rank) && is_square_empty(file, one_rank) {
+                    add_move_highlight(file, two_rank, false);
+                }
+            }
+        }
+
+        diag_file := file - 1;
+        diag_rank := rank + forward;
+        if is_square_inside_board(diag_file, diag_rank) {
+            enemy := find_piece_at(diag_file, diag_rank);
+            if enemy != null && enemy.colour != colour {
+                add_move_highlight(diag_file, diag_rank, true);
+            }
+        }
+
+        diag_file = file + 1;
+        if is_square_inside_board(diag_file, diag_rank) {
+            enemy := find_piece_at(diag_file, diag_rank);
+            if enemy != null && enemy.colour != colour {
+                add_move_highlight(diag_file, diag_rank, true);
+            }
+        }
+    }
+
+    add_move_highlight :: method(file: int, rank: int, is_capture: bool) {
+        highlight := Scene.create_entity();
+        highlight.set_local_position(world_position_for_square(file, rank));
+        highlight.set_local_scale({get_board_square_size() * 1.25, get_board_square_size() * 1.25});
+
+        sprite := highlight.add_component(Sprite_Renderer);
+        if sprite != null {
+            sprite.set_texture(get_asset(Texture_Asset, "white_tile.png"));
+            if is_capture {
+                sprite.color = {1, 0.2, 0.2, 0.75};
+            } else {
+                sprite.color = {0.2, 1, 0.2, 0.75};
+            }
+            sprite.layer = 5;
+        }
+
+        highlight_comp := highlight.add_component(Move_Highlight);
+        highlight_comp.owner = this;
+        highlight_comp.target_file = file;
+        highlight_comp.target_rank = rank;
+        highlight_comp.is_capture = is_capture;
+
+        append(ref move_highlights, highlight);
+    }
+
+    perform_move :: method(target_file: int, target_rank: int, is_capture: bool) {
+        target_piece := find_piece_at(target_file, target_rank);
+        if target_piece != null && target_piece != this {
+            if target_piece.controller != null {
+                target_piece.release_controller();
+            }
+            target_piece.entity.destroy();
+        }
+
+        entity.set_local_position(world_position_for_square(target_file, target_rank));
+        square = format_string("%%", {file_letter(target_file), target_rank});
+        clear_move_highlights();
+        release_controller();
+        end_turn();
+    }
+
+    file_letter :: method(file: int) -> string {
+        if file == 1 {
+            return "A";
+        } else if file == 2 {
+            return "B";
+        } else if file == 3 {
+            return "C";
+        } else if file == 4 {
+            return "D";
+        } else if file == 5 {
+            return "E";
+        } else if file == 6 {
+            return "F";
+        } else if file == 7 {
+            return "G";
+        } else if file == 8 {
+            return "H";
+        }
+        return "";
+    }
+
     ao_end :: method() {
         if controller != null {
             controller.remove_invisibility_reason(piece);
@@ -130,6 +357,14 @@ Controllable_Entity :: class : Component {
             controller.is_controlling = false;
             controller.pos_offset = 0;
         }
+        clear_move_highlights();
         controller = null;
     }
+}
+
+Move_Highlight :: class : Component {
+    owner: Controllable_Entity;
+    target_file: int;
+    target_rank: int;
+    is_capture: bool;
 }
