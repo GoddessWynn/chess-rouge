@@ -3,7 +3,7 @@
 3470580694
 {
   "name": "Black Queen",
-  "local_enabled": true,
+  "local_enabled": false,
   "local_position": {
     "X": -0.5249999761581421,
     "Y": 3.9500000476837158

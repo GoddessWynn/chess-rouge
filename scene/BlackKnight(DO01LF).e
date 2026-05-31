@@ -3,7 +3,7 @@
 3469955781
 {
   "name": "Black Knight",
-  "local_enabled": true,
+  "local_enabled": false,
   "local_position": {
     "X": -2.6749999523162842,
     "Y": 3.7500000000000000

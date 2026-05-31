@@ -3,7 +3,7 @@
 3464541110
 {
   "name": "Black King",
-  "local_enabled": true,
+  "local_enabled": false,
   "local_position": {
     "X": 0.5249999761581421,
     "Y": 4

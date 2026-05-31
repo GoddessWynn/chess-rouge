@@ -3,7 +3,7 @@
 3465508379
 {
   "name": "White Rook",
-  "local_enabled": true,
+  "local_enabled": false,
   "local_position": {
     "X": -3.7500000000000000,
     "Y": -3.7500000000000000

@@ -3,7 +3,7 @@
 3457277711
 {
   "name": "White Bishop",
-  "local_enabled": true,
+  "local_enabled": false,
   "local_position": {
     "X": 1.6000000238418579,
     "Y": -3.7000000476837158
