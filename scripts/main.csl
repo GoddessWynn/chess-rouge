@@ -1,7 +1,49 @@
 import "core:ao"
 
+// Whose turn it is for the shared chess board. true = White to move, false = Black.
+// Pieces can only be picked up on their own colour's turn (turn-based play).
 current_turn_is_white: bool = true;
 
+// --- Check / checkmate / draw state (shared board state) ---
+game_in_check: bool = false;      // True while the side to move is in check.
+game_in_checkmate: bool = false;  // True once the side to move is checkmated (game over).
+game_check_colour: string = "";   // The colour currently in check / checkmated.
+game_draw: bool = false;          // True once the game has ended in a draw.
+game_draw_reason: string = "";    // Why it's a draw (Stalemate, Insufficient material, ...).
+
+halfmove_clock: int = 0;          // Half-moves since the last pawn move or capture (fifty-move rule).
+position_history: [..]string;     // Position signatures seen this game (threefold repetition).
+
+// --- En passant board state (shared, like the turn flag above) ---
+// When a pawn double-steps, the square it "skipped over" becomes a capture target
+// that an adjacent enemy pawn may move onto for exactly one move. 0 = none available.
+en_passant_target_file: int = 0;   // File of the square the capturing pawn would move TO.
+en_passant_target_rank: int = 0;   // Rank of that square.
+en_passant_victim_file: int = 0;   // File of the double-stepped pawn that gets captured.
+en_passant_victim_rank: int = 0;   // Rank of that pawn.
+
+// Arms an en passant opportunity (called when a pawn double-steps).
+set_en_passant :: proc(target_file: int, target_rank: int, victim_file: int, victim_rank: int) {
+    en_passant_target_file = target_file;
+    en_passant_target_rank = target_rank;
+    en_passant_victim_file = victim_file;
+    en_passant_victim_rank = victim_rank;
+}
+
+// Clears any en passant opportunity (it only lasts one move).
+clear_en_passant :: proc() {
+    en_passant_target_file = 0;
+    en_passant_target_rank = 0;
+    en_passant_victim_file = 0;
+    en_passant_victim_rank = 0;
+}
+
+// True if an en passant capture is currently available.
+has_en_passant :: proc() -> bool {
+    return en_passant_target_file != 0;
+}
+
+// Returns the human-readable name of the colour whose turn it currently is.
 get_turn_name :: proc() -> string {
     if current_turn_is_white {
         return "White";
@@ -9,6 +51,7 @@ get_turn_name :: proc() -> string {
     return "Black";
 }
 
+// Returns true if it is the given colour's turn to move ("White" or "Black").
 is_piece_turn :: proc(colour: string) -> bool {
     if colour == "White" {
         return current_turn_is_white;
@@ -16,44 +59,180 @@ is_piece_turn :: proc(colour: string) -> bool {
     return !current_turn_is_white;
 }
 
+// Flips the active turn from White to Black (or vice-versa).
 end_turn :: proc() {
     current_turn_is_white = !current_turn_is_white;
 }
 
-tp :: proc(player: Player, x: float = 0, y: float = 0) {
-    player.entity.set_local_position({x, y});
-    Notifier.notify(player, format_string("Teleported to (%, %)", {x, y}));
-} @chat_command
-tell_me :: proc(player: Player) {
-    Notifier.notify(player, format_string("You are in %", {player.which_chess_square()}));
-} @chat_command
+// Resets the fifty-move half-move clock on a pawn move or capture, otherwise advances it.
+update_halfmove_clock :: proc(was_pawn: bool, was_capture: bool) {
+    if was_pawn || was_capture {
+        halfmove_clock = 0;
+    } else {
+        halfmove_clock += 1;
+    }
+}
+
+// Records the current position for threefold-repetition detection.
+record_position :: proc() {
+    append(ref position_history, chess_position_signature());
+}
+
+// How many times the most recently recorded position has occurred this game.
+count_current_repetitions :: proc() -> int {
+    if position_history.count == 0 {
+        return 0;
+    }
+    latest := position_history[position_history.count - 1];
+    c := 0;
+    for s: position_history {
+        if s == latest {
+            c += 1;
+        }
+    }
+    return c;
+}
+
+// Records the position then re-evaluates the game. Called once a move is fully resolved
+// (immediately for normal moves, after the choice is made for promotions).
+finalize_turn :: proc() {
+    record_position();
+    update_game_state();
+}
+
+// Recomputes check, checkmate, and every draw condition for the side now to move.
+update_game_state :: proc() {
+    board := chess_build_board();
+    to_move := get_turn_name();
+
+    game_in_check = false;
+    game_in_checkmate = false;
+    game_check_colour = "";
+    game_draw = false;
+    game_draw_reason = "";
+
+    in_check := chess_is_in_check(board, to_move);
+    has_move := chess_has_any_legal_move(board, to_move);
+
+    if in_check {
+        game_in_check = true;
+        game_check_colour = to_move;
+        if !has_move {
+            game_in_checkmate = true;
+        }
+        return;
+    }
+
+    // Not in check - look for the draw conditions.
+    if !has_move {
+        game_draw = true;
+        game_draw_reason = "Stalemate";
+        return;
+    }
+    if chess_is_insufficient_material(board) {
+        game_draw = true;
+        game_draw_reason = "Insufficient material";
+        return;
+    }
+    if halfmove_clock >= 100 {
+        game_draw = true;
+        game_draw_reason = "Fifty-move rule";
+        return;
+    }
+    if count_current_repetitions() >= 3 {
+        game_draw = true;
+        game_draw_reason = "Threefold repetition";
+        return;
+    }
+}
+
+// Number of players currently connected.
+count_players :: proc() -> int {
+    c := 0;
+    for p: component_iterator(Player) {
+        c += 1;
+    }
+    return c;
+}
+
+// Number of players who have voted to reset the board.
+count_reset_votes :: proc() -> int {
+    c := 0;
+    for p: component_iterator(Player) {
+        if p.voted_reset {
+            c += 1;
+        }
+    }
+    return c;
+}
+
+// Restores the whole board to the starting position and clears all game state. Triggered
+// once every connected player has voted to reset after a finished game.
+reset_board :: proc() {
+    for ce: component_iterator(Controllable_Entity) {
+        ce.reset_to_start();
+    }
+    current_turn_is_white = true;
+    clear_en_passant();
+    game_in_check = false;
+    game_in_checkmate = false;
+    game_check_colour = "";
+    game_draw = false;
+    game_draw_reason = "";
+    halfmove_clock = 0;
+    position_history.clear();
+    for p: component_iterator(Player) {
+        p.voted_reset = false;
+    }
+}
 
 // Game wide systems
 ao_before_scene_load :: proc() {
     // Called before the scene is loaded (economy registration etc...)
 }
 
+// Global game start hook (runs once when the game begins).
 ao_start :: proc() {
 }
 
+// Global per-frame update hook (`dt` is delta time in seconds).
 ao_update :: proc(dt: float) {
+    // Drive the solo-mode chess AI (no-op unless solo mode is on).
+    ai_tick(dt);
+
+    // Once a game has finished, reset the board as soon as everyone has voted for it.
+    if game_in_checkmate || game_draw {
+        total := count_players();
+        if total > 0 && count_reset_votes() >= total {
+            reset_board();
+        }
+    }
 }
 
+// Global end-of-frame update hook, after all ao_update calls have run.
 ao_late_update :: proc(dt: float) {
 }
 
 // Per player state
 Player :: class : Player_Base {
-    is_controlling: bool;
-    pos_offset: float;
-    illegal_move_timer: float;
-    illegal_move_text: string;
+    is_controlling: bool;       // True while this player is actively controlling a chess piece.
+    pos_offset: float;          // Vertical offset between the player's feet and the controlled piece's center.
+    illegal_move_timer: float;  // Counts down (seconds) while the "Illegal Move" warning is shown.
+    illegal_move_text: string;  // The warning text to display while illegal_move_timer > 0.
+    controlling_legal_square: bool; // While controlling: is the piece currently over a legal destination? (drives HUD colour)
+    voted_reset: bool;              // True if this player has voted to reset after a finished game.
 
+    // Pawn promotion: while pending, this player sees a popup to pick a replacement piece.
+    promotion_pending: bool;              // True while the promotion popup should be shown.
+    promotion_piece: Controllable_Entity; // The pawn that reached the last rank and is being promoted.
+
+    // Runs once when this player joins. Clears any leftover illegal-move warning state.
     ao_start :: method() {
         illegal_move_timer = 0;
         illegal_move_text = "";
     }
 
+    // Per-frame update: ticks down the illegal-move warning and clears it when it expires.
     ao_update :: method(dt: float) {
         if illegal_move_timer > 0 {
             illegal_move_timer -= dt;
@@ -64,13 +243,18 @@ Player :: class : Player_Base {
         }
     }
 
+    // Draws this player's on-screen UI. All UI is drawn here in late_update.
     ao_late_update :: method(dt: float) {
+        // Only draw the status HUD for the player viewing their own screen.
         if is_local() {
+            // The usable screen area (accounts for notches/safe areas on phones).
             screen := UI.get_safe_screen_rect();
 
+            // --- "<colour> to move" banner, centered near the top of the screen ---
             turn_text_rect := screen.top_center_rect().offset(0, -40);
             turn_text_ts := UI.default_text_settings();
             turn_text_ts.size = 42;
+            // Turn the banner red while an illegal move is being shown, otherwise white.
             if illegal_move_timer > 0 {
                 turn_text_ts.color = {1, 0, 0, 1};
             } else {
@@ -80,6 +264,7 @@ Player :: class : Player_Base {
             turn_text_ts.valign = .CENTER;
             UI.text(turn_text_rect, turn_text_ts, format_string("% to move", {get_turn_name()}));
 
+            // --- Optional "Illegal Move" warning, shown just below the turn banner ---
             if illegal_move_timer > 0 {
                 illegal_text_rect := screen.top_center_rect().offset(0, -90);
                 illegal_text_ts := UI.default_text_settings();
@@ -90,49 +275,269 @@ Player :: class : Player_Base {
                 UI.text(illegal_text_rect, illegal_text_ts, illegal_move_text);
             }
 
+            // --- "On board / Not on board" status text, below the warning area ---
             standing_text_rect := screen.top_center_rect().offset(0, -130);
             standing_text_ts := UI.default_text_settings();
             standing_text_ts.size = 52;
             standing_text_ts.color = {1, 1, 1, 1};
             standing_text_ts.halign = .CENTER;
             standing_text_ts.valign = .CENTER;
-            
+
             standing_text := "Not on board";
             if is_on_chess_board() {
                 standing_text = "On board";
+                // While controlling, append the square being hovered (e.g. "On board (E4)").
                 if is_controlling {
-                    standing_text_ts.color = {0, 1, 0, 1};
                     standing_text = format_string("% (%)", {standing_text, which_chess_square()});
                 }
-            } else {
-                standing_text = "Not on board";
-                if is_controlling {
+            }
+
+            // While controlling, colour the text by whether the piece's current square is a
+            // LEGAL move for it: green = legal destination, red = illegal (incl. off board).
+            if is_controlling {
+                if controlling_legal_square {
+                    standing_text_ts.color = {0, 1, 0, 1};
+                } else {
                     standing_text_ts.color = {1, 0, 0, 1};
                 }
             }
             UI.text(standing_text_rect, standing_text_ts, standing_text);
+
+            // --- Check / Checkmate banner ---
+            if game_in_checkmate {
+                cm_rect := screen.top_center_rect().offset(0, -200);
+                cm_ts := UI.default_text_settings();
+                cm_ts.size = 58;
+                cm_ts.color = {1, 0.2, 0.2, 1};
+                cm_ts.halign = .CENTER;
+                cm_ts.valign = .CENTER;
+                winner := chess_enemy_colour(game_check_colour);
+                UI.text(cm_rect, cm_ts, format_string("Checkmate! % wins", {winner}));
+            } else if game_draw {
+                d_rect := screen.top_center_rect().offset(0, -200);
+                d_ts := UI.default_text_settings();
+                d_ts.size = 50;
+                d_ts.color = {0.9, 0.85, 0.4, 1};
+                d_ts.halign = .CENTER;
+                d_ts.valign = .CENTER;
+                UI.text(d_rect, d_ts, format_string("Draw - %", {game_draw_reason}));
+            } else if game_in_check {
+                chk_rect := screen.top_center_rect().offset(0, -200);
+                chk_ts := UI.default_text_settings();
+                chk_ts.size = 46;
+                chk_ts.color = {1, 0.35, 0.35, 1};
+                chk_ts.halign = .CENTER;
+                chk_ts.valign = .CENTER;
+                UI.text(chk_rect, chk_ts, format_string("% in Check!", {game_check_colour}));
+            }
+        }
+
+        // The promotion popup is interactive, so it must run on BOTH the local client
+        // and the server (so the clicked choice is authoritative and syncs). is_local_or_server()
+        // is true for the local player on a client, and for every player on the server.
+        if is_local_or_server() {
+            draw_solo_button();
+            if g_solo_mode {
+                draw_ai_depth_button();
+            }
+
+            if promotion_pending {
+                draw_promotion_popup();
+            } else if game_in_checkmate || game_draw {
+                draw_reset_vote();
+            }
+
+            version_text_rect := UI.get_safe_screen_rect().bottom_left_rect().offset(190, 25);
+            version_ts := UI.default_text_settings();
+            version_ts.size = 35;
+            version_ts.color = {1, 1, 1, 1};
+            version_ts.halign = .CENTER;
+            version_ts.valign = .CENTER;
+            UI.text(version_text_rect, version_ts, "Version: 26.1-prototype.4");
+
+            lag_warning_text_rect := UI.get_safe_screen_rect().bottom_right_rect().offset(-310, 25);
+            lag_warning_ts := UI.default_text_settings();
+            lag_warning_ts.size = 35;
+            lag_warning_ts.color = {1, 0, 0, 1};
+            lag_warning_ts.halign = .CENTER;
+            lag_warning_ts.valign = .CENTER;
+            if g_ai_depth == 3 {
+                UI.text(lag_warning_text_rect, lag_warning_ts, "AI Mode 3 gives lag! Might be fixed in future!");
+            }
         }
     }
 
+    // Left-side button to start / leave a solo game against the chess AI.
+    draw_solo_button :: method() {
+        screen := UI.get_safe_screen_rect();
+        rect := screen.left_center_rect().offset(130, 0).grow(36, 100, 36, 100);
+
+        bs := UI.default_button_settings();
+        ts := UI.default_text_settings();
+        ts.size = 28;
+        ts.color = {1, 1, 1, 1};
+        ts.halign = .CENTER;
+        ts.valign = .CENTER;
+
+        label := "Play Solo";
+        if g_solo_mode {
+            label = "Exit Solo";
+        }
+
+        res := UI.button(rect, bs, ts, label);
+        if res.clicked {
+            if g_solo_mode {
+                stop_solo();
+            } else {
+                start_solo_game();
+            }
+        }
+    }
+
+    // Button (below Play Solo, solo mode only) to cycle the AI search depth 1/2/3.
+    draw_ai_depth_button :: method() {
+        screen := UI.get_safe_screen_rect();
+        rect := screen.left_center_rect().offset(130, -90).grow(36, 100, 36, 100);
+
+        bs := UI.default_button_settings();
+        ts := UI.default_text_settings();
+        ts.size = 26;
+        ts.color = {1, 1, 1, 1};
+        ts.halign = .CENTER;
+        ts.valign = .CENTER;
+
+        res := UI.button(rect, bs, ts, format_string("AI Mode: %", {g_ai_depth}));
+        if res.clicked {
+            cycle_ai_depth();
+        }
+    }
+
+    // Draws the "vote to reset" button after a game ends. The board resets once every
+    // connected player has voted (handled in the global ao_update).
+    draw_reset_vote :: method() {
+        total := count_players();
+        votes := count_reset_votes();
+
+        screen := UI.get_safe_screen_rect();
+        center := screen.center_rect();
+        btn_rect := center.offset(0, -120).grow(38, 220, 38, 220);
+
+        bs := UI.default_button_settings();
+        ts := UI.default_text_settings();
+        ts.size = 28;
+        ts.color = {1, 1, 1, 1};
+        ts.halign = .CENTER;
+        ts.valign = .CENTER;
+
+        label := format_string("Vote to Reset (%/%)", {votes, total});
+        if voted_reset {
+            label = format_string("Waiting for others (%/%)", {votes, total});
+        }
+        res := UI.button(btn_rect, bs, ts, label);
+        if res.clicked && !voted_reset {
+            voted_reset = true;
+        }
+    }
+
+    // Draws the pawn-promotion popup (Queen / Rook / Bishop / Knight) and applies the
+    // chosen piece when one is clicked. Uses the legacy UI.* API to match the rest of the HUD.
+    draw_promotion_popup :: method() {
+        // If the pawn was somehow removed before a choice was made, just dismiss.
+        if !#alive(promotion_piece) {
+            promotion_pending = false;
+            remove_freeze_reason("promotion");
+            promotion_piece = null;
+            return;
+        }
+
+        panel_tex := get_asset(Texture_Asset, "white_tile.png");
+        screen := UI.get_safe_screen_rect();
+        center := screen.center_rect();
+
+        // Dim the rest of the screen behind the popup.
+        UI.quad(screen, panel_tex, {0, 0, 0, 0.6});
+
+        // Popup panel (560 wide x 300 tall, centered).
+        panel := center.grow(160, 280, 140, 280);
+        UI.quad(panel, panel_tex, {0.10, 0.11, 0.16, 0.97});
+
+        // Title.
+        title_ts := UI.default_text_settings();
+        title_ts.size = 40;
+        title_ts.color = {1, 1, 1, 1};
+        title_ts.halign = .CENTER;
+        title_ts.valign = .CENTER;
+        UI.text(center.offset(0, 110).grow(28, 250, 28, 250), title_ts, "Promote to");
+
+        // Four piece choices, shown as icon buttons with a caption.
+        options: [4]string = {"Queen", "Rook", "Bishop", "Knight"};
+        bs := UI.default_button_settings();
+        caption_ts := UI.default_text_settings();
+        caption_ts.size = 22;
+        caption_ts.color = {1, 1, 1, 1};
+        caption_ts.halign = .CENTER;
+        caption_ts.valign = .CENTER;
+
+        button_half := 60.0;       // 120 x 120 buttons.
+        step := 126.0;             // Horizontal spacing between button centers.
+        first_cx := -1.5 * step;   // Centers the row of four buttons on the panel.
+        for i: 0..3 {
+            cx := first_cx + i.(float) * step;
+            brect := center.offset(cx, -6).grow(button_half);
+
+            // Each button needs a UNIQUE id. With empty labels they would all share one
+            // widget id, so only one button registered clicks and it reported the wrong option.
+            UI.push_id(options[i]);
+            res := UI.button(brect, bs, caption_ts, "");
+            UI.pop_id();
+
+            // Piece icon drawn on top of the button.
+            icon_tex := get_asset(Texture_Asset, format_string("Chess_%_%.png", {promotion_piece.colour, options[i]}));
+            UI.quad(brect.inset(14), icon_tex, {1, 1, 1, 1});
+
+            // Caption below the button.
+            UI.text(center.offset(cx, -96).grow(16, 70, 16, 70), caption_ts, options[i]);
+
+            if res.clicked {
+                promotion_piece.promote_to(options[i]);
+                promotion_pending = false;
+                remove_freeze_reason("promotion");
+                promotion_piece = null;
+                return;
+            }
+        }
+    }
+
+    // Returns true if the player is currently standing within the bounds of the chess board.
     is_on_chess_board :: method() -> bool {
         board_entity := Scene.get_entity_by_name("Chess Board");
         if board_entity == null {
             return false;
         }
 
+        // Offset relative to the board's center. pos_offset shifts from the player's
+        // feet up to the controlled piece's center so detection lines up correctly.
         delta := entity.world_position - board_entity.world_position;
         delta.y += pos_offset;
+        // The board is 8.5 units square, so anything within +/-4.25 on both axes is on it.
         return abs(delta.x) <= 4.25 && abs(delta.y) <= 4.25;
     }
 
+    // Returns the algebraic name (e.g. "A1".."H8") of the square the player stands on.
     which_chess_square :: method() -> string {
         board_entity := Scene.get_entity_by_name("Chess Board");
 
+        // Position relative to the board center, compensating for the piece offset.
         delta := entity.world_position - board_entity.world_position;
         delta.y += pos_offset;
+        // Convert the local offset into 1-based file/rank coordinates.
+        // (delta + 4.25) shifts the range to 0..8.5, dividing by the square size
+        // (8.5/8) gives 0..8, and +1 makes it roughly 1..9.
         chess_file := ((delta.x + 4.25) / (8.5 / 8)) + 1;
         chess_rank := ((delta.y + 4.25) / (8.5 / 8)) + 1;
         chess_square := "";
+        // Bucket the continuous file value into a letter column A-H, pairing it with
+        // the integer rank to form the square name.
         if chess_file > 0 && chess_file >= 1 && chess_file < 2 {
             chess_square = format_string("A%", {chess_rank.(int)});
         } else if chess_file > 1 && chess_file >= 2 && chess_file < 3 {
@@ -154,15 +559,18 @@ Player :: class : Player_Base {
         return chess_square;
     }
 
+    // Runs once when this player is destroyed (e.g. disconnect).
     ao_end :: method() {
         // On destroy
     }
 
+    // Global gate for ability usage; return false to block (e.g. while dead).
     ao_can_use_ability :: method(ability: Ability_Base) -> bool {
         // Global ability callback for example don't allow use when dead
         return true;
     }
 
+    // Global gate for interacting with Interactables; return false to block.
     ao_can_use_interactable :: method(interactable: Interactable) -> bool {
         // Global interactable callback
         return true;

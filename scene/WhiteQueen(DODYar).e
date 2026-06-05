@@ -3,7 +3,7 @@
 3456992939
 {
   "name": "White Queen",
-  "local_enabled": false,
+  "local_enabled": true,
   "local_position": {
     "X": -0.5249999761581421,
     "Y": -3.5499999523162842

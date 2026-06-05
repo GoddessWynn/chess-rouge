@@ -1,0 +1,148 @@
+// Chat commands live here. This is a proc-only file (no component) and is auto-compiled
+// with the rest of /scripts, so the commands work without any import.
+
+// Maps a single digit character ("0".."9") to its value.
+char_to_digit :: proc(ch: string) -> int, bool {
+    if ch == "0" { return 0, true; }
+    if ch == "1" { return 1, true; }
+    if ch == "2" { return 2, true; }
+    if ch == "3" { return 3, true; }
+    if ch == "4" { return 4, true; }
+    if ch == "5" { return 5, true; }
+    if ch == "6" { return 6, true; }
+    if ch == "7" { return 7, true; }
+    if ch == "8" { return 8, true; }
+    if ch == "9" { return 9, true; }
+    return 0, false;
+}
+
+// Parses a string like "10", "-3", or "2.5" into a float. The engine has no built-in
+// string->number parser, so we do it by hand. Returns false if the text isn't a number.
+str_to_float :: proc(s: string) -> float, bool {
+    str := string_trim(s);
+    n := str.count;
+    if n == 0 {
+        return 0, false;
+    }
+
+    i := 0;
+    sign := 1.0;
+    first := string_substring(str, 0, 1);
+    if first == "-" {
+        sign = -1.0;
+        i = 1;
+    } else if first == "+" {
+        i = 1;
+    }
+
+    int_part := 0.0;
+    frac_part := 0.0;
+    frac_scale := 1.0;
+    seen_digit := false;
+    seen_dot := false;
+
+    while i < n {
+        ch := string_substring(str, i, 1);
+        if ch == "." {
+            if seen_dot {
+                return 0, false;
+            }
+            seen_dot = true;
+        } else {
+            d, ok := char_to_digit(ch);
+            if !ok {
+                return 0, false;
+            }
+            seen_digit = true;
+            if seen_dot {
+                frac_scale = frac_scale * 10.0;
+                frac_part = frac_part + d.(float) / frac_scale;
+            } else {
+                int_part = int_part * 10.0 + d.(float);
+            }
+        }
+        i = i + 1;
+    }
+
+    if !seen_digit {
+        return 0, false;
+    }
+    return sign * (int_part + frac_part), true;
+}
+
+// Finds a connected player by (case-insensitive) username.
+find_player_by_name :: proc(name: string) -> Player, bool {
+    wanted := to_lower(string_trim(name));
+    for p: component_iterator(Player) {
+        if to_lower(p.get_username()) == wanted {
+            return p, true;
+        }
+    }
+    return null, false;
+}
+
+// Teleports the caller to either a player or an x/y coordinate. Owner only.
+// Usage: /tp "Player Name"   or   /tp <x> <y>
+tp :: proc(player: Player, arg1: string = "", arg2: string = "") {
+    if arg1 == "" {
+        Notifier.notify(player, "Usage: /tp <player>  or  /tp <x> <y>");
+        return;
+    }
+
+    // One argument -> teleport to the named player.
+    if arg2 == "" {
+        target, found := find_player_by_name(arg1);
+        if !found {
+            Notifier.notify(player, format_string("No player named '%'.", {arg1}));
+            return;
+        }
+        player.entity.set_local_position(target.entity.world_position);
+        Notifier.notify(player, format_string("Teleported to %.", {target.get_username()}));
+        return;
+    }
+
+    // Two arguments -> teleport to coordinates.
+    x, okx := str_to_float(arg1);
+    y, oky := str_to_float(arg2);
+    if !okx || !oky {
+        Notifier.notify(player, "Coordinates must be numbers. Usage: /tp <x> <y>");
+        return;
+    }
+    player.entity.set_local_position({x, y});
+    Notifier.notify(player, format_string("Teleported to (%, %).", {x, y}));
+} @chat_command @owner
+
+// --- Game control (owner only) ---
+
+// Instantly resets the board to the starting position (skips the vote). Usage: /resetboard
+resetboard :: proc(player: Player) {
+    reset_board();
+    Notifier.notify(player, "Board reset.");
+} @chat_command @owner
+
+// Captures every piece of the given colour except its king. Handy for quickly setting up
+// checkmate / stalemate / insufficient-material scenarios. Usage: /clearside Black
+clearside :: proc(player: Player, colour: string = "White") {
+    for ce: component_iterator(Controllable_Entity) {
+        if ce.captured {
+            continue;
+        }
+        if ce.colour == colour && ce.piece != "King" {
+            ce.mark_captured();
+        }
+    }
+    update_game_state();
+    Notifier.notify(player, format_string("Cleared % pieces (kept the king).", {colour}));
+} @chat_command @owner
+
+// --- Utility (anyone) ---
+
+// Tells you which chess square you're standing on. Usage: /square
+square :: proc(player: Player) {
+    sq := player.which_chess_square();
+    if sq == "" {
+        Notifier.notify(player, "You're not on the board.");
+    } else {
+        Notifier.notify(player, format_string("You are on %.", {sq}));
+    }
+} @chat_command @any

@@ -3,7 +3,7 @@
 3465802309
 {
   "name": "White King ",
-  "local_enabled": false,
+  "local_enabled": true,
   "local_position": {
     "X": 0.5249999761581421,
     "Y": -3.5000000000000000

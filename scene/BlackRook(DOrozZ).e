@@ -3,7 +3,7 @@
 3467545817
 {
   "name": "Black Rook",
-  "local_enabled": false,
+  "local_enabled": true,
   "local_position": {
     "X": 3.7500000000000000,
     "Y": 3.7500000000000000
@@ -13,7 +13,8 @@
     "X": 1.5000000000000000,
     "Y": 1.5000000000000000
   },
-  "previous_sibling": 3460869696
+  "previous_sibling": 3460869696,
+  "next_sibling": 3468523989
 },
 {
   "cid": 1,

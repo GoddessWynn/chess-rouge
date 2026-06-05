@@ -1,47 +1,49 @@
+// A chess piece in the world that a player can walk up to and "control".
+// Once controlled, the player physically moves the piece around with their input.
 Controllable_Entity :: class : Component {
-    piece: string @ao_serialize;
-    colour: string @ao_serialize;
-    starting_square: string @ao_serialize;
+    piece: string @ao_serialize;           // Piece type: "Pawn", "Rook", "Knight", "Bishop", "Queen", "King".
+    colour: string @ao_serialize;          // "White" or "Black".
+    starting_square: string @ao_serialize; // Algebraic square this piece starts on (e.g. "E2").
 
-    interactable: Interactable;
-    movement_agent: Movement_Agent;
-    board_entity: Entity;
-    move_highlights: [..]Entity;
-    square: string;
-    pos_offset: float;
-    controller: Player;
+    interactable: Interactable;       // The "Control"/"Release" interaction prompt component.
+    movement_agent: Movement_Agent;   // Drives this entity's movement while controlled.
+    board_entity: Entity;             // Cached reference to the "Chess Board" entity.
+    move_highlights: [..]Entity;      // Spawned highlight tiles showing legal destinations.
+    square: string;                   // The piece's current square; starts as starting_square.
+    pos_offset: float;                // Vertical gap between the controlling player's feet and the piece center.
+    controller: Player;               // The player currently controlling this piece, or null.
+    has_moved: bool;                  // True once this piece has moved (used to gate castling).
+    control_origin: v2;               // Where the piece sat when control was taken (used to snap back on illegal moves).
+    captured: bool;                   // True while captured: hidden off-board but kept alive so reset can restore it.
+    original_piece: string;           // Piece type at game start (restores promoted pawns on reset).
+    start_position: v2;               // Local position at game start (restored on reset).
 
+    // Initializes the interaction prompt, per-piece offsets, and movement agent.
     ao_start :: method() {
+        // Remember the starting type and position so the board can be reset later.
+        original_piece = piece;
+        start_position = entity.local_position;
+
+        // Default the current square to the configured starting square.
         if square == "" {
             square = starting_square;
         }
 
+        // Create the interaction prompt if it doesn't already exist.
         if interactable == null {
             interactable = entity.add_component(Interactable);
         }
 
+        // Route interaction callbacks (can_use / on_interact) to this component,
+        // and require a 1 second hold within 0.75 units to take control.
         interactable.set_listener(this);
         interactable.set_text("Control");
         interactable.set_hold_text("Controlling...");
         interactable.radius = 0.75;
         interactable.required_hold_time = 1.0;
-        if piece == "Pawn" || piece == "Rook" || piece == "Knight" || piece == "Bishop" {
-            interactable.prompt_offset = {0, 0.65};
-            if piece == "Pawn" || piece == "Knight" {
-                pos_offset = 1;
-            } else if piece == "Rook" {
-                pos_offset = 0.95;
-            } else if piece == "Bishop" {
-                pos_offset = 0.9;
-            }
-        } else if piece == "Queen" {
-            interactable.prompt_offset = {0, 0.75};
-            pos_offset = 0.7;
-        } else if piece == "King" {
-            interactable.prompt_offset = {0, 0.8};
-            pos_offset = 0.7;
-        }
+        apply_piece_offsets();
 
+        // Ensure the piece has a Movement_Agent (reuse an existing one if present).
         if movement_agent == null {
             movement_agent = entity.get_component(Movement_Agent);
             if movement_agent == null {
@@ -49,6 +51,7 @@ Controllable_Entity :: class : Component {
             }
         }
 
+        // Give it a default movement speed if one wasn't configured.
         if movement_agent != null && movement_agent.movement_speed == 0.0 {
             movement_agent.movement_speed = 10.0;
         }
@@ -57,39 +60,103 @@ Controllable_Entity :: class : Component {
         update_prompt();
     }
 
+    // Sets the interaction prompt offset and the player stand-offset based on the
+    // current piece type. Re-run after a pawn promotes so the new piece lines up.
+    apply_piece_offsets :: method() {
+        if interactable != null {
+            if piece == "Pawn" || piece == "Rook" || piece == "Knight" || piece == "Bishop" {
+                interactable.prompt_offset = {0, 0.65};
+            } else if piece == "Queen" {
+                interactable.prompt_offset = {0, 0.75};
+            } else if piece == "King" {
+                interactable.prompt_offset = {0, 0.8};
+            }
+        }
+
+        // How far below the piece's center the controlling player stands (taller
+        // pieces sit higher above their base).
+        if piece == "Pawn" || piece == "Knight" {
+            pos_offset = 1;
+        } else if piece == "Rook" {
+            pos_offset = 0.95;
+        } else if piece == "Bishop" {
+            pos_offset = 0.9;
+        } else if piece == "Queen" {
+            pos_offset = 0.7;
+        } else if piece == "King" {
+            pos_offset = 0.7;
+        }
+    }
+
+    // Interactable gate: decides whether `player` is allowed to use the prompt.
     can_use :: method(player: Player) -> bool {
+        // A player already controlling something can only interact with the piece
+        // they control (to release it).
         if player.is_controlling {
             return controller == player;
         }
-        return controller == null || controller == player;
+        // A piece controlled by someone else can't be taken.
+        if controller != null {
+            return controller == player;
+        }
+        // A captured piece (hidden off-board) can never be interacted with.
+        if captured {
+            return false;
+        }
+        // Game over: nothing is grabbable once the game has ended (checkmate or draw).
+        if game_in_checkmate || game_draw {
+            return false;
+        }
+        // In solo mode the AI controls its own colour - the human can't grab those pieces.
+        if g_solo_mode && colour == g_ai_colour {
+            return false;
+        }
+        // Turn-based: a free piece is only grabbable on its own colour's turn.
+        return is_piece_turn(colour);
     }
 
+    // Called when a player completes the interaction hold.
     on_interact :: method(player: Player) {
+        // Interacting with the piece you already control releases it.
         if controller == player {
             release_controller();
             return;
         }
 
-        if piece == "Pawn" && !is_piece_turn(colour) {
+        // Turn-based: a piece may only be picked up on its own colour's turn, and not
+        // after the game has ended. Move legality is further enforced on release (the
+        // piece must be dropped on a highlighted, non-check-exposing square).
+        if captured || game_in_checkmate || game_draw {
+            return;
+        }
+        // In solo mode the human can't take control of the AI's pieces.
+        if g_solo_mode && colour == g_ai_colour {
+            return;
+        }
+        if !is_piece_turn(colour) {
             return;
         }
 
         controller = player;
+        // Remember where the piece started so we can snap it back if the move is illegal.
+        control_origin = entity.local_position;
         controller.entity.set_local_position({entity.local_position.x, entity.local_position.y - pos_offset});
         controller.pos_offset = pos_offset;
 
+        // Hide the player's own avatar (they "become" the piece) and tag their name.
         controller.add_invisibility_reason(piece);
         controller.set_name_override(format_string("% (%)", {controller.get_username(), piece}));
         controller.is_controlling = true;
 
-        if piece == "Pawn" {
-            spawn_move_highlights();
-        }
+        // Show the legal destination tiles for whichever piece was taken.
+        spawn_move_highlights();
 
         update_prompt();
     }
 
+    // Per-frame: keep the piece in sync with its controller's input, or release if gone.
     ao_update :: method(dt: float) {
+        // If the controlling player disappeared (disconnect), drop control.
         if controller != null && !#alive(controller) {
             release_controller();
             return;
@@ -99,6 +166,12 @@ Controllable_Entity :: class : Component {
             return;
         }
 
+        // Tell the controller whether the piece is currently sitting over a legal
+        // destination (drives the green/red HUD square text for the local player).
+        controller.controlling_legal_square = is_over_legal_highlight();
+
+        // Drive the piece using the controller's movement input.
+        // Runs on the local client and the server so movement stays smooth and authoritative.
         if controller.is_local_or_server() && movement_agent != null {
             movement_agent.velocity = controller.agent.input_this_frame * movement_agent.movement_speed;
         }
@@ -107,51 +180,91 @@ Controllable_Entity :: class : Component {
     ao_late_update :: method(dt: float) {
     }
 
+    // Releases the current controller and resolves the attempted move: if the piece was
+    // dropped on one of its legal-move highlights the move is committed, otherwise the
+    // piece snaps back to where it was picked up and an "Illegal Move" warning is shown.
     release_controller :: method() {
         if controller == null {
             return;
         }
 
-        if piece == "Pawn" {
-            piece_pos := entity.world_position;
-            found_move := false;
-            for highlight_entity: move_highlights {
-                if highlight_entity == null {
-                    continue;
-                }
-
-                dist := length(piece_pos - highlight_entity.world_position);
-                if dist <= 0.5 {
-                    highlight_comp := highlight_entity.get_component(Move_Highlight);
-                    if highlight_comp != null {
-                        found_move = true;
-                        controller.remove_invisibility_reason(piece);
-                        controller.set_name_override(format_string("%", {controller.get_username()}));
-                        controller.is_controlling = false;
-                        controller.pos_offset = 0;
-                        controller = null;
-                        highlight_comp.owner.perform_move(highlight_comp.target_file, highlight_comp.target_rank, highlight_comp.is_capture);
-                        return;
-                    }
-                }
+        // Find the highlight (if any) the piece was dropped on.
+        piece_pos := entity.world_position;
+        chosen_move: Move_Highlight = null;
+        for highlight_entity: move_highlights {
+            if highlight_entity == null {
+                continue;
             }
-
-            if !found_move {
-                controller.illegal_move_timer = 1.5;
-                controller.illegal_move_text = "Illegal Move";
+            dist := length(piece_pos - highlight_entity.world_position);
+            if dist <= 0.5 {
+                highlight_comp := highlight_entity.get_component(Move_Highlight);
+                if highlight_comp != null {
+                    chosen_move = highlight_comp;
+                    break;
+                }
             }
         }
 
-        controller.remove_invisibility_reason(piece);
-        controller.set_name_override(format_string("%", {controller.get_username()}));
-        controller.is_controlling = false;
-        controller.pos_offset = 0;
-
+        // Take the player out of "controlling" state regardless of the outcome.
+        releasing_player := controller;
+        releasing_player.remove_invisibility_reason(piece);
+        releasing_player.set_name_override(format_string("%", {releasing_player.get_username()}));
+        releasing_player.is_controlling = false;
+        releasing_player.pos_offset = 0;
         controller = null;
+        if movement_agent != null {
+            movement_agent.velocity = {0, 0};
+        }
+
+        if chosen_move != null {
+            // Legal move: commit it (handles captures, castling, en passant, promotion).
+            perform_move(chosen_move, releasing_player);
+            // Move the player to stand at the piece's new square (the player goes to the
+            // piece, not the other way around).
+            reposition_player_to_piece(releasing_player);
+            return;
+        }
+
+        // Not dropped on a legal square: snap the piece back to where it started.
+        entity.set_local_position(control_origin);
+        // Only warn if the player actually tried to move it somewhere. Releasing the
+        // piece roughly where it was picked up is treated as a harmless cancel.
+        if length(piece_pos - control_origin) > 0.5 {
+            releasing_player.illegal_move_timer = 2;
+            releasing_player.illegal_move_text = "Illegal Move";
+        }
+
+        // The player follows the piece back to its square too.
+        reposition_player_to_piece(releasing_player);
         clear_move_highlights();
         update_prompt();
     }
 
+    // Places the player at the base of this piece (mirrors how pickup snaps the player
+    // onto the piece). Used on release so the player ends up standing with the piece.
+    reposition_player_to_piece :: method(p: Player) {
+        if p == null {
+            return;
+        }
+        pp := entity.world_position;
+        p.entity.set_local_position({pp.x, pp.y - pos_offset});
+    }
+
+    // True if the piece is currently positioned over one of its legal-move highlights.
+    is_over_legal_highlight :: method() -> bool {
+        piece_pos := entity.world_position;
+        for highlight_entity: move_highlights {
+            if highlight_entity == null {
+                continue;
+            }
+            if length(piece_pos - highlight_entity.world_position) <= 0.5 {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Updates the interaction prompt text to reflect whether the piece is controlled.
     update_prompt :: method() {
         if interactable == null {
             return;
@@ -165,6 +278,22 @@ Controllable_Entity :: class : Component {
         }
     }
 
+    // Changes this pawn into the chosen piece type (called from the promotion popup).
+    // Updates the gameplay type, swaps the sprite, and re-applies stand/prompt offsets.
+    promote_to :: method(new_piece: string) {
+        piece = new_piece;
+        sprite := entity.get_component(Sprite_Renderer);
+        if sprite != null {
+            sprite.set_texture(get_asset(Texture_Asset, format_string("Chess_%_%.png", {colour, new_piece})));
+        }
+        apply_piece_offsets();
+
+        // Now that the replacement piece is known, record the position and re-evaluate
+        // check / checkmate / draws.
+        finalize_turn();
+    }
+
+    // Destroys all spawned move-highlight tiles and empties the list.
     clear_move_highlights :: method() {
         for highlight: move_highlights {
             if highlight != null {
@@ -174,6 +303,20 @@ Controllable_Entity :: class : Component {
         move_highlights.clear();
     }
 
+    // Returns the Move_Highlight on the most recently spawned tile, so callers can
+    // tag it with extra info (en passant / castling / double-step). Null if none.
+    last_highlight :: method() -> Move_Highlight {
+        if move_highlights.count == 0 {
+            return null;
+        }
+        last_entity := move_highlights[move_highlights.count - 1];
+        if last_entity == null {
+            return null;
+        }
+        return last_entity.get_component(Move_Highlight);
+    }
+
+    // Returns the board entity, caching the lookup after the first call.
     get_board_entity :: method() -> Entity {
         if board_entity == null {
             board_entity = Scene.get_entity_by_name("Chess Board");
@@ -181,10 +324,13 @@ Controllable_Entity :: class : Component {
         return board_entity;
     }
 
+    // The world-space size of a single board square (board is 8.5 units / 8 squares).
     get_board_square_size :: method() -> float {
         return 8.5 / 8.0;
     }
 
+    // Computes this piece's current 1-based file and rank from its world position.
+    // Results are written back through the `ref` parameters.
     get_board_file_rank :: method(file: ref int, rank: ref int) {
         board_entity := get_board_entity();
         if board_entity == null {
@@ -193,35 +339,47 @@ Controllable_Entity :: class : Component {
             return;
         }
 
+        // Offset from the board center; +4.25 shifts the -4.25..4.25 range to 0..8.5,
+        // then divide by square size and add 1 for a 1-based index.
         delta := entity.world_position - board_entity.world_position;
         file = ((delta.x + 4.25) / get_board_square_size()).(int) + 1;
         rank = ((delta.y + 4.25) / get_board_square_size()).(int) + 1;
     }
 
+    // True if (file, rank) is a valid on-board coordinate (1..8 on both axes).
     is_square_inside_board :: method(file: int, rank: int) -> bool {
         return file >= 1 && file <= 8 && rank >= 1 && rank <= 8;
     }
 
+    // Converts a 1-based (file, rank) into the world-space center of that square.
     world_position_for_square :: method(file: int, rank: int) -> v2 {
         board_entity := get_board_entity();
         if board_entity == null {
             return {0, 0};
         }
 
+        // Start at the board's left/bottom edge (-4.25), step in by whole squares,
+        // then add half a square to land on the square's center.
         half_square := get_board_square_size() * 0.5;
         x := board_entity.world_position.x + (-4.25 + (file - 1).(float) * get_board_square_size() + half_square);
         y := board_entity.world_position.y + (-4.25 + (rank - 1).(float) * get_board_square_size() + half_square);
         return {x, y};
     }
 
+    // Returns the piece occupying (file, rank), or null if empty / off-board.
     find_piece_at :: method(file: int, rank: int) -> Controllable_Entity {
         if !is_square_inside_board(file, rank) {
             return null;
         }
 
+        // A piece counts as "on" the square if it's within 35% of a square's size
+        // of that square's center.
         target_pos := world_position_for_square(file, rank);
         for other: component_iterator(Controllable_Entity) {
             if other == this {
+                continue;
+            }
+            if other.captured {
                 continue;
             }
             if length(other.entity.world_position - target_pos) <= get_board_square_size() * 0.35 {
@@ -232,6 +390,7 @@ Controllable_Entity :: class : Component {
         return null;
     }
 
+    // True if (file, rank) is on the board and has no piece on it.
     is_square_empty :: method(file: int, rank: int) -> bool {
         if !is_square_inside_board(file, rank) {
             return false;
@@ -239,12 +398,12 @@ Controllable_Entity :: class : Component {
         return find_piece_at(file, rank) == null;
     }
 
+    // Spawns highlight tiles for every square the controlled piece may legally move to,
+    // dispatching to the rule set for its piece type.
     spawn_move_highlights :: method() {
         clear_move_highlights();
-        if piece != "Pawn" {
-            return;
-        }
 
+        // Determine the piece's current square; bail if it's somehow off the board.
         file := 0;
         rank := 0;
         get_board_file_rank(ref file, ref rank);
@@ -252,6 +411,71 @@ Controllable_Entity :: class : Component {
             return;
         }
 
+        if piece == "Pawn" {
+            spawn_pawn_highlights(file, rank);
+        } else if piece == "Rook" {
+            // Straight lines along files and ranks, blocked by pieces.
+            spawn_rook_highlights(file, rank);
+        } else if piece == "Bishop" {
+            // Diagonals only, blocked by pieces.
+            spawn_bishop_highlights(file, rank);
+        } else if piece == "Queen" {
+            // Queen = rook + bishop.
+            spawn_rook_highlights(file, rank);
+            spawn_bishop_highlights(file, rank);
+        } else if piece == "Knight" {
+            // L-shaped jumps; may pass over other pieces.
+            spawn_knight_highlights(file, rank);
+        } else if piece == "King" {
+            // One square in any direction, blocked by pieces (plus castling).
+            spawn_king_highlights(file, rank);
+        }
+
+        // Remove any candidate that would leave our own king in check (illegal).
+        filter_illegal_highlights(file, rank);
+    }
+
+    // Removes highlights whose move would leave this piece's own king in check, using a
+    // board simulation. This is what enforces pins and the "you must get out of check" rule.
+    filter_illegal_highlights :: method(from_file: int, from_rank: int) {
+        board := chess_build_board();
+        my_colour := colour;
+        i := 0;
+        while i < move_highlights.count {
+            he := move_highlights[i];
+            keep := true;
+            if he != null {
+                mh := he.get_component(Move_Highlight);
+                if mh != null {
+                    // For en passant the captured pawn isn't on the destination square,
+                    // so tell the simulation which square to also clear.
+                    ep_vf := 0;
+                    ep_vr := 0;
+                    if mh.is_en_passant {
+                        ep_vf = en_passant_victim_file;
+                        ep_vr = en_passant_victim_rank;
+                    }
+                    after := chess_board_after_move(board, from_file, from_rank, mh.target_file, mh.target_rank, ep_vf, ep_vr);
+                    if chess_is_in_check(after, my_colour) {
+                        keep = false;
+                    }
+                }
+            }
+            if keep {
+                i += 1;
+            } else {
+                if he != null {
+                    he.destroy();
+                }
+                move_highlights.unordered_remove_by_index(i);
+            }
+        }
+    }
+
+    // Pawn moves: one step forward, two from the starting rank, diagonal captures,
+    // and en passant.
+    spawn_pawn_highlights :: method(file: int, rank: int) {
+        // White pawns advance up the board from rank 2; Black pawns advance down from rank 7.
         forward := 1.(int);
         starting_rank := 2.(int);
         if colour == "Black" {
@@ -259,51 +483,200 @@ Controllable_Entity :: class : Component {
             starting_rank = 7;
         }
 
+        // Single step forward (only if the square ahead is empty).
         one_rank := rank + forward;
         if is_square_inside_board(file, one_rank) && is_square_empty(file, one_rank) {
             add_move_highlight(file, one_rank, false);
+            // Double step from the starting rank (both squares ahead must be empty).
             if rank == starting_rank {
                 two_rank := rank + forward * 2.(int);
                 if is_square_inside_board(file, two_rank) && is_square_empty(file, two_rank) && is_square_empty(file, one_rank) {
                     add_move_highlight(file, two_rank, false);
+                    // This double-step lets an adjacent enemy pawn capture en passant next move.
+                    // The skipped square (file, one_rank) becomes the capture target; this pawn
+                    // (which ends on (file, two_rank)) becomes the victim.
+                    h := last_highlight();
+                    if h != null {
+                        h.arms_en_passant = true;
+                        h.ep_arm_target_file = file;
+                        h.ep_arm_target_rank = one_rank;
+                        h.ep_arm_victim_file = file;
+                        h.ep_arm_victim_rank = two_rank;
+                    }
                 }
             }
         }
 
-        diag_file := file - 1;
-        diag_rank := rank + forward;
-        if is_square_inside_board(diag_file, diag_rank) {
-            enemy := find_piece_at(diag_file, diag_rank);
-            if enemy != null && enemy.colour != colour {
-                add_move_highlight(diag_file, diag_rank, true);
-            }
+        // Diagonal captures (including en passant), one to each side.
+        try_pawn_diagonal(file - 1, rank + forward);
+        try_pawn_diagonal(file + 1, rank + forward);
+    }
+
+    // Considers a single pawn diagonal: a normal capture if an enemy sits there, or an
+    // en passant capture if it lands on the current en passant target square.
+    try_pawn_diagonal :: method(diag_file: int, diag_rank: int) {
+        if !is_square_inside_board(diag_file, diag_rank) {
+            return;
         }
 
-        diag_file = file + 1;
-        if is_square_inside_board(diag_file, diag_rank) {
-            enemy := find_piece_at(diag_file, diag_rank);
-            if enemy != null && enemy.colour != colour {
+        // Normal diagonal capture.
+        enemy := find_piece_at(diag_file, diag_rank);
+        if enemy != null && enemy.colour != colour {
+            add_move_highlight(diag_file, diag_rank, true);
+            return;
+        }
+
+        // En passant: the diagonal lands on the empty square a pawn just skipped over,
+        // capturing that pawn (which sits beside us).
+        if has_en_passant() && diag_file == en_passant_target_file && diag_rank == en_passant_target_rank {
+            victim := find_piece_at(en_passant_victim_file, en_passant_victim_rank);
+            if victim != null && victim.colour != colour && victim.piece == "Pawn" {
                 add_move_highlight(diag_file, diag_rank, true);
+                h := last_highlight();
+                if h != null {
+                    h.is_en_passant = true;
+                    h.ep_victim = victim;
+                }
             }
         }
     }
 
+    // Rook moves: slide along the four orthogonal directions until blocked.
+    spawn_rook_highlights :: method(file: int, rank: int) {
+        add_sliding_highlights(file, rank, 1, 0);
+        add_sliding_highlights(file, rank, -1, 0);
+        add_sliding_highlights(file, rank, 0, 1);
+        add_sliding_highlights(file, rank, 0, -1);
+    }
+
+    // Bishop moves: slide along the four diagonals until blocked.
+    spawn_bishop_highlights :: method(file: int, rank: int) {
+        add_sliding_highlights(file, rank, 1, 1);
+        add_sliding_highlights(file, rank, 1, -1);
+        add_sliding_highlights(file, rank, -1, 1);
+        add_sliding_highlights(file, rank, -1, -1);
+    }
+
+    // Knight moves: the eight L-shaped destinations. Knights ignore any pieces in between.
+    spawn_knight_highlights :: method(file: int, rank: int) {
+        add_step_highlight(file, rank, 1, 2);
+        add_step_highlight(file, rank, 2, 1);
+        add_step_highlight(file, rank, 2, -1);
+        add_step_highlight(file, rank, 1, -2);
+        add_step_highlight(file, rank, -1, -2);
+        add_step_highlight(file, rank, -2, -1);
+        add_step_highlight(file, rank, -2, 1);
+        add_step_highlight(file, rank, -1, 2);
+    }
+
+    // King moves: one square in each of the eight directions, plus castling.
+    spawn_king_highlights :: method(file: int, rank: int) {
+        add_step_highlight(file, rank, 1, 0);
+        add_step_highlight(file, rank, -1, 0);
+        add_step_highlight(file, rank, 0, 1);
+        add_step_highlight(file, rank, 0, -1);
+        add_step_highlight(file, rank, 1, 1);
+        add_step_highlight(file, rank, 1, -1);
+        add_step_highlight(file, rank, -1, 1);
+        add_step_highlight(file, rank, -1, -1);
+
+        // Castling: only if the king itself has never moved.
+        // NOTE: there's no check detection in this game, so the "king not in/through
+        // check" conditions are not enforced - only the structural ones.
+        if !has_moved {
+            try_castle(file, rank, 8, 7, 6); // Kingside: rook on file 8, king -> 7, rook -> 6.
+            try_castle(file, rank, 1, 3, 4); // Queenside: rook on file 1, king -> 3, rook -> 4.
+        }
+    }
+
+    // Adds a castling highlight if the rook on `rook_file` is eligible and all squares
+    // strictly between the king and that rook are empty.
+    try_castle :: method(file: int, rank: int, rook_file: int, king_target_file: int, rook_target_file: int) {
+        rook := find_piece_at(rook_file, rank);
+        if rook == null || rook.piece != "Rook" || rook.colour != colour || rook.has_moved {
+            return;
+        }
+
+        // Every square between the king and rook must be empty.
+        lo := min(file, rook_file) + 1;
+        hi := max(file, rook_file) - 1;
+        f := lo;
+        while f <= hi {
+            if !is_square_empty(f, rank) {
+                return;
+            }
+            f += 1;
+        }
+
+        add_move_highlight(king_target_file, rank, false);
+        h := last_highlight();
+        if h != null {
+            h.is_castle = true;
+            h.castle_rook = rook;
+            h.castle_rook_target_file = rook_target_file;
+        }
+    }
+
+    // Walks outward from (file, rank) in direction (dx, dy), highlighting each empty
+    // square. Stops at the first piece encountered: highlighting it as a capture if it's
+    // an enemy, and never continuing past it (sliding pieces cannot jump over pieces).
+    // Used by the rook, bishop, and queen.
+    add_sliding_highlights :: method(file: int, rank: int, dx: int, dy: int) {
+        nf := file + dx;
+        nr := rank + dy;
+        while is_square_inside_board(nf, nr) {
+            other := find_piece_at(nf, nr);
+            if other == null {
+                add_move_highlight(nf, nr, false);
+            } else {
+                // Blocked: capture an enemy on this square, then stop in this direction.
+                if other.colour != colour {
+                    add_move_highlight(nf, nr, true);
+                }
+                break;
+            }
+            nf += dx;
+            nr += dy;
+        }
+    }
+
+    // Highlights the single destination at (file+dx, rank+dy) if it's on the board and not
+    // occupied by a friendly piece (an enemy there is highlighted as a capture).
+    // Used by the knight and king (single-step movers).
+    add_step_highlight :: method(file: int, rank: int, dx: int, dy: int) {
+        nf := file + dx;
+        nr := rank + dy;
+        if !is_square_inside_board(nf, nr) {
+            return;
+        }
+        other := find_piece_at(nf, nr);
+        if other == null {
+            add_move_highlight(nf, nr, false);
+        } else if other.colour != colour {
+            add_move_highlight(nf, nr, true);
+        }
+    }
+
+    // Creates a single coloured highlight tile at (file, rank).
+    // Green = quiet move, red = capture. `is_capture` is stored for move resolution.
     add_move_highlight :: method(file: int, rank: int, is_capture: bool) {
         highlight := Scene.create_entity();
         highlight.set_local_position(world_position_for_square(file, rank));
         highlight.set_local_scale({get_board_square_size() * 1.25, get_board_square_size() * 1.25});
 
+        // Visual tile.
         sprite := highlight.add_component(Sprite_Renderer);
         if sprite != null {
             sprite.set_texture(get_asset(Texture_Asset, "white_tile.png"));
             if is_capture {
-                sprite.color = {1, 0.2, 0.2, 0.75};
+                sprite.color = {1, 0.2, 0.2, 0.75}; // Reddish for captures.
             } else {
-                sprite.color = {0.2, 1, 0.2, 0.75};
+                sprite.color = {0.2, 1, 0.2, 0.75}; // Greenish for quiet moves.
             }
-            sprite.layer = 5;
+            sprite.layer = 5; // Draw above the board.
         }
 
+        // Data component the release logic reads to know which move this tile represents.
         highlight_comp := highlight.add_component(Move_Highlight);
         highlight_comp.owner = this;
         highlight_comp.target_file = file;
@@ -313,22 +686,75 @@ Controllable_Entity :: class : Component {
         append(ref move_highlights, highlight);
     }
 
-    perform_move :: method(target_file: int, target_rank: int, is_capture: bool) {
-        target_piece := find_piece_at(target_file, target_rank);
-        if target_piece != null && target_piece != this {
-            if target_piece.controller != null {
-                target_piece.release_controller();
+    // Commits a legal move described by `move` (chosen via the highlight it was dropped on).
+    // Handles captures, en passant, castling, the piece's relocation, arming en passant for
+    // the next move, pawn promotion, and ending the turn. `mover` is the player who moved.
+    perform_move :: method(move: Move_Highlight, mover: Player) {
+        target_file := move.target_file;
+        target_rank := move.target_rank;
+        was_capture := move.is_capture || move.is_en_passant;
+        was_pawn := piece == "Pawn";
+
+        // This move supersedes any pending en passant opportunity from the previous move.
+        clear_en_passant();
+
+        if move.is_en_passant {
+            // En passant: the captured pawn sits beside the destination, not on it.
+            if move.ep_victim != null && #alive(move.ep_victim) {
+                move.ep_victim.mark_captured();
             }
-            target_piece.entity.destroy();
+        } else {
+            // Normal capture: remove any piece already on the destination square.
+            target_piece := find_piece_at(target_file, target_rank);
+            if target_piece != null && target_piece != this {
+                target_piece.mark_captured();
+            }
         }
 
+        // Castling: slide the matching rook to the far side of the king.
+        if move.is_castle && move.castle_rook != null && #alive(move.castle_rook) {
+            rook := move.castle_rook;
+            rook.entity.set_local_position(world_position_for_square(move.castle_rook_target_file, target_rank));
+            rook.square = format_string("%%", {file_letter(move.castle_rook_target_file), target_rank});
+            rook.has_moved = true;
+        }
+
+        // Move this piece onto the destination square.
         entity.set_local_position(world_position_for_square(target_file, target_rank));
         square = format_string("%%", {file_letter(target_file), target_rank});
+        has_moved = true;
+
+        // Pawn double-step arms en passant for the opponent's next move.
+        if move.arms_en_passant {
+            set_en_passant(move.ep_arm_target_file, move.ep_arm_target_rank, move.ep_arm_victim_file, move.ep_arm_victim_rank);
+        }
+
+        // Destroying the highlights also frees `move`, so do it after all reads above.
         clear_move_highlights();
-        release_controller();
+        update_prompt();
+
+        // A pawn reaching the final rank (8 for White, 1 for Black) triggers a promotion
+        // choice for the player who moved it.
+        is_promotion := piece == "Pawn" && (target_rank == 8 || target_rank == 1);
+        if is_promotion {
+            if mover != null {
+                mover.promotion_pending = true;
+                mover.promotion_piece = this;
+                mover.add_freeze_reason("promotion");
+            }
+        }
+
         end_turn();
+
+        // Advance the fifty-move clock now. For a promotion we defer recording the
+        // position and evaluating the game until the replacement piece is chosen.
+        update_halfmove_clock(was_pawn, was_capture);
+        if !is_promotion {
+            finalize_turn();
+        }
     }
 
+    // Converts a 1-based file number (1..8) into its column letter (A..H).
     file_letter :: method(file: int) -> string {
         if file == 1 {
             return "A";
@@ -350,6 +776,55 @@ Controllable_Entity :: class : Component {
         return "";
     }
 
+    // Marks this piece as captured: releases any controller, hides the sprite, and parks
+    // the piece off-board. The entity stays alive so the board can be restored on reset.
+    mark_captured :: method() {
+        if controller != null {
+            controller.remove_invisibility_reason(piece);
+            controller.set_name_override(format_string("%", {controller.get_username()}));
+            controller.is_controlling = false;
+            controller.pos_offset = 0;
+            controller = null;
+        }
+        clear_move_highlights();
+        captured = true;
+        sprite := entity.get_component(Sprite_Renderer);
+        if sprite != null {
+            sprite.color = {1, 1, 1, 0}; // Fully transparent = hidden.
+        }
+        entity.set_local_position({1000, 1000}); // Parked far off the board.
+    }
+
+    // Restores this piece to its starting square and type (used by the vote-to-reset).
+    reset_to_start :: method() {
+        if controller != null {
+            controller.remove_invisibility_reason(piece);
+            controller.set_name_override(format_string("%", {controller.get_username()}));
+            controller.is_controlling = false;
+            controller.pos_offset = 0;
+            controller = null;
+        }
+        clear_move_highlights();
+
+        captured = false;
+        piece = original_piece;
+        square = starting_square;
+        has_moved = false;
+
+        sprite := entity.get_component(Sprite_Renderer);
+        if sprite != null {
+            sprite.set_texture(get_asset(Texture_Asset, format_string("Chess_%_%.png", {colour, original_piece})));
+            sprite.color = {1, 1, 1, 1};
+        }
+        apply_piece_offsets();
+        entity.set_local_position(start_position);
+        if movement_agent != null {
+            movement_agent.velocity = {0, 0};
+        }
+    }
+
+    // Runs when this piece is destroyed (e.g. captured): release the controller
+    // (restoring their avatar/name) and clean up highlights.
     ao_end :: method() {
         if controller != null {
             controller.remove_invisibility_reason(piece);
@@ -362,9 +837,27 @@ Controllable_Entity :: class : Component {
     }
 }
 
+// Lightweight data component attached to each highlight tile, describing the move
+// it represents so release_controller / perform_move can resolve the chosen destination.
 Move_Highlight :: class : Component {
-    owner: Controllable_Entity;
-    target_file: int;
-    target_rank: int;
-    is_capture: bool;
+    owner: Controllable_Entity; // The piece that spawned this highlight.
+    target_file: int;           // Destination file (1..8).
+    target_rank: int;           // Destination rank (1..8).
+    is_capture: bool;           // Whether moving here captures an enemy piece (colours the tile).
+
+    // En passant capture: this move removes a pawn sitting beside the destination square.
+    is_en_passant: bool;
+    ep_victim: Controllable_Entity; // The pawn captured en passant.
+
+    // Pawn double-step: arms an en passant opportunity for the opponent's next move.
+    arms_en_passant: bool;
+    ep_arm_target_file: int; // Square an enemy pawn could capture onto.
+    ep_arm_target_rank: int;
+    ep_arm_victim_file: int; // Where this pawn ends up (the capturable pawn).
+    ep_arm_victim_rank: int;
+
+    // Castling: this king move also slides a rook to the far side.
+    is_castle: bool;
+    castle_rook: Controllable_Entity; // The rook that castles with the king.
+    castle_rook_target_file: int;     // File the rook ends up on.
 }

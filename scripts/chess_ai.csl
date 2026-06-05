@@ -1,0 +1,356 @@
+// Single-player "Play Solo" mode: the human plays one colour, a simple chess AI plays the
+// other. The AI reuses the board model in chess_rules.csl (move generation + check tests)
+// and an alpha-beta minimax search. It is fully DETERMINISTIC (no rng) so the client and
+// server compute the same move and stay in sync under client prediction.
+
+g_solo_mode: bool = false;        // True while playing against the AI.
+g_ai_colour: string = "Black";    // Colour the AI plays (human plays the other).
+g_ai_pending: bool = false;       // An AI move is queued (waiting out the think delay).
+g_ai_think_timer: float = 0;      // Counts down before the AI commits its move.
+g_ai_depth: int = 2;              // Search depth (plies). Cycled 1/2/3 by the in-game button.
+
+// A concrete move on the board model.
+AI_Move :: struct {
+    from_file: int;
+    from_rank: int;
+    to_file:   int;
+    to_rank:   int;
+    victim_file: int; // En passant only (0 otherwise).
+    victim_rank: int;
+    is_castle: bool;      // King castling move (also slides a rook).
+    rook_from_file: int;
+    rook_to_file: int;
+}
+
+// Centipawn value of a piece for the evaluation (king handled via checkmate scoring).
+ai_piece_value :: proc(piece: string) -> int {
+    if piece == "Pawn"   { return 100; }
+    if piece == "Knight" { return 320; }
+    if piece == "Bishop" { return 330; }
+    if piece == "Rook"   { return 500; }
+    if piece == "Queen"  { return 900; }
+    return 0;
+}
+
+// Material balance from the AI's point of view (AI total - human total).
+ai_eval :: proc(board: Chess_Board) -> int {
+    score := 0;
+    f := 1;
+    while f <= 8 {
+        r := 1;
+        while r <= 8 {
+            idx := chess_index(f, r);
+            p := board.piece[idx];
+            if p != "" {
+                v := ai_piece_value(p);
+                if board.colour[idx] == g_ai_colour {
+                    score += v;
+                } else {
+                    score -= v;
+                }
+            }
+            r += 1;
+        }
+        f += 1;
+    }
+    return score;
+}
+
+// Returns the board after applying move `m` (handles normal moves, en passant, castling).
+ai_board_after_move :: proc(board: Chess_Board, m: AI_Move) -> Chess_Board {
+    if m.is_castle {
+        b := board;
+        kfrom := chess_index(m.from_file, m.from_rank);
+        kto   := chess_index(m.to_file, m.from_rank);
+        rfrom := chess_index(m.rook_from_file, m.from_rank);
+        rto   := chess_index(m.rook_to_file, m.from_rank);
+        b.piece[kto] = b.piece[kfrom];   b.colour[kto] = b.colour[kfrom];
+        b.piece[kfrom] = "";             b.colour[kfrom] = "";
+        b.piece[rto] = b.piece[rfrom];   b.colour[rto] = b.colour[rfrom];
+        b.piece[rfrom] = "";             b.colour[rfrom] = "";
+        return b;
+    }
+    return chess_board_after_move(board, m.from_file, m.from_rank, m.to_file, m.to_rank, m.victim_file, m.victim_rank);
+}
+
+// Adds a castling move for the king at (kf,kr) if the rook is eligible and the squares
+// between are empty. King-ends-in-check is filtered here; castling through/while-in-check
+// is not checked (matching the entity-side castling rules).
+ai_try_castle :: proc(board: Chess_Board, colour: string, kf: int, kr: int, rook_file: int, king_target: int, rook_target: int, out: ref [..]AI_Move) {
+    ridx := chess_index(rook_file, kr);
+    if board.piece[ridx] != "Rook" || board.colour[ridx] != colour || board.moved[ridx] {
+        return;
+    }
+
+    lo := kf + 1;
+    hi := rook_file - 1;
+    if rook_file < kf {
+        lo = rook_file + 1;
+        hi = kf - 1;
+    }
+    c := lo;
+    while c <= hi {
+        if board.piece[chess_index(c, kr)] != "" {
+            return;
+        }
+        c += 1;
+    }
+
+    mv: AI_Move;
+    mv.from_file = kf;
+    mv.from_rank = kr;
+    mv.to_file = king_target;
+    mv.to_rank = kr;
+    mv.is_castle = true;
+    mv.rook_from_file = rook_file;
+    mv.rook_to_file = rook_target;
+
+    after := ai_board_after_move(board, mv);
+    if !chess_is_in_check(after, colour) {
+        append(ref out, mv);
+    }
+}
+
+// Collects every legal move for `colour`. Castling is only generated when `allow_castle`
+// is true (the root), since the board model only carries accurate has_moved flags there.
+ai_legal_moves :: proc(board: Chess_Board, colour: string, allow_castle: bool, out: ref [..]AI_Move) {
+    f := 1;
+    while f <= 8 {
+        r := 1;
+        while r <= 8 {
+            idx := chess_index(f, r);
+            if board.piece[idx] != "" && board.colour[idx] == colour {
+                dests: [..]Chess_Move;
+                chess_generate_moves(board, f, r, ref dests);
+                j := 0;
+                while j < dests.count {
+                    d := dests[j];
+                    mv: AI_Move;
+                    mv.from_file = f;
+                    mv.from_rank = r;
+                    mv.to_file = d.file;
+                    mv.to_rank = d.rank;
+                    mv.victim_file = d.victim_file;
+                    mv.victim_rank = d.victim_rank;
+                    after := ai_board_after_move(board, mv);
+                    if !chess_is_in_check(after, colour) {
+                        append(ref out, mv);
+                    }
+                    j += 1;
+                }
+
+                if allow_castle && board.piece[idx] == "King" && !board.moved[idx] {
+                    ai_try_castle(board, colour, f, r, 8, 7, 6, ref out); // kingside
+                    ai_try_castle(board, colour, f, r, 1, 3, 4, ref out); // queenside
+                }
+            }
+            r += 1;
+        }
+        f += 1;
+    }
+}
+
+// Alpha-beta minimax over the material evaluation. The AI maximises, the human minimises.
+ai_minimax :: proc(board: Chess_Board, side_to_move: string, depth: int, alpha: int, beta: int) -> int {
+    if depth <= 0 {
+        return ai_eval(board);
+    }
+
+    moves: [..]AI_Move;
+    ai_legal_moves(board, side_to_move, false, ref moves);
+
+    if moves.count == 0 {
+        if chess_is_in_check(board, side_to_move) {
+            if side_to_move == g_ai_colour {
+                return -100000;
+            }
+            return 100000;
+        }
+        return 0;
+    }
+
+    a := alpha;
+    b := beta;
+
+    if side_to_move == g_ai_colour {
+        best := -2000000;
+        i := 0;
+        while i < moves.count {
+            after := ai_board_after_move(board, moves[i]);
+            score := ai_minimax(after, chess_enemy_colour(side_to_move), depth - 1, a, b);
+            if score > best {
+                best = score;
+            }
+            if best > a {
+                a = best;
+            }
+            if a >= b {
+                break;
+            }
+            i += 1;
+        }
+        return best;
+    }
+
+    best := 2000000;
+    i := 0;
+    while i < moves.count {
+        after := ai_board_after_move(board, moves[i]);
+        score := ai_minimax(after, chess_enemy_colour(side_to_move), depth - 1, a, b);
+        if score < best {
+            best = score;
+        }
+        if best < b {
+            b = best;
+        }
+        if a >= b {
+            break;
+        }
+        i += 1;
+    }
+    return best;
+}
+
+// Picks the AI's best move on `board`. Returns false if the AI has no legal moves.
+ai_choose_move :: proc(board: Chess_Board, out: ref AI_Move) -> bool {
+    moves: [..]AI_Move;
+    ai_legal_moves(board, g_ai_colour, true, ref moves);
+    if moves.count == 0 {
+        return false;
+    }
+
+    best_score := -3000000;
+    best_index := 0;
+    i := 0;
+    while i < moves.count {
+        after := ai_board_after_move(board, moves[i]);
+        score := ai_minimax(after, chess_enemy_colour(g_ai_colour), g_ai_depth - 1, -2000000, 2000000);
+        if moves[i].is_castle {
+            score += 40; // gentle nudge so the AI actually castles when it's roughly equal
+        }
+        if score > best_score {
+            best_score = score;
+            best_index = i;
+        }
+        i += 1;
+    }
+
+    out = moves[best_index];
+    return true;
+}
+
+// Cycles the AI search depth 1 -> 2 -> 3 -> 1.
+cycle_ai_depth :: proc() {
+    g_ai_depth += 1;
+    if g_ai_depth > 3 {
+        g_ai_depth = 1;
+    }
+}
+
+// Finds the live AI piece sitting on (file, rank).
+ai_find_piece_at :: proc(file: int, rank: int) -> Controllable_Entity {
+    for ce: component_iterator(Controllable_Entity) {
+        if ce.captured {
+            continue;
+        }
+        f := 0;
+        r := 0;
+        ce.get_board_file_rank(ref f, ref r);
+        if f == file && r == rank && ce.colour == g_ai_colour {
+            return ce;
+        }
+    }
+    return null;
+}
+
+// Plays the chosen move on the real board by reusing the piece's own highlight + move
+// pipeline (so captures, en passant, castling, end-of-turn and evaluation all happen).
+ai_execute_move :: proc(mv: AI_Move) {
+    piece := ai_find_piece_at(mv.from_file, mv.from_rank);
+    if piece == null {
+        return;
+    }
+
+    piece.spawn_move_highlights();
+    chosen: Move_Highlight = null;
+    k := 0;
+    while k < piece.move_highlights.count {
+        he := piece.move_highlights[k];
+        if he != null {
+            mh := he.get_component(Move_Highlight);
+            if mh != null && mh.target_file == mv.to_file && mh.target_rank == mv.to_rank {
+                chosen = mh;
+            }
+        }
+        k += 1;
+    }
+
+    if chosen == null {
+        piece.clear_move_highlights();
+        return;
+    }
+
+    is_promo := piece.piece == "Pawn" && (mv.to_rank == 8 || mv.to_rank == 1);
+    // mover = null: no promotion popup is shown. perform_move defers finalizing for a
+    // promotion, so we auto-queen right after to complete the turn.
+    piece.perform_move(chosen, null);
+    if is_promo {
+        piece.promote_to("Queen");
+    }
+}
+
+// Computes and plays the AI's move for the current position.
+ai_make_move :: proc() {
+    board := chess_build_board();
+    mv: AI_Move;
+    if ai_choose_move(board, ref mv) {
+        ai_execute_move(mv);
+    }
+}
+
+// Starts a fresh solo game: AI plays Black, human plays White (and moves first).
+start_solo_game :: proc() {
+    g_solo_mode = true;
+    g_ai_colour = "Black";
+    g_ai_pending = false;
+    g_ai_think_timer = 0;
+    reset_board();
+}
+
+// Leaves solo mode and resets to a normal (shared) game.
+stop_solo :: proc() {
+    g_solo_mode = false;
+    g_ai_pending = false;
+    reset_board();
+}
+
+// Drives the AI each frame. After the human moves, the AI "thinks" briefly (so the board
+// is settled/synced) then commits exactly one move on its turn.
+// NOTE: called from main.csl's ao_update (a second top-level ao_update in this file does
+// not reliably run).
+ai_tick :: proc(dt: float) {
+    if !g_solo_mode {
+        return;
+    }
+    if game_in_checkmate || game_draw {
+        return;
+    }
+
+    // Only act on the AI's turn.
+    if get_turn_name() != g_ai_colour {
+        g_ai_pending = false;
+        return;
+    }
+
+    if !g_ai_pending {
+        g_ai_pending = true;
+        g_ai_think_timer = 0.7;
+        return;
+    }
+
+    g_ai_think_timer -= dt;
+    if g_ai_think_timer <= 0 {
+        g_ai_pending = false;
+        ai_make_move();
+    }
+}

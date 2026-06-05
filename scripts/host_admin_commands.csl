@@ -1,0 +1,341 @@
+// // Self-contained host/admin commands. EVERYTHING needed for moderation lives in this one
+// // file: the commands, the persisted ban storage, and the join/rejoin enforcement. No other
+// // script file is involved. (Lifecycle hooks like ao_update are collected per-file by the
+// // engine, so the enforcement loop below runs alongside main.csl's own ao_update.)
+
+// // True if `player` is the host of this private server. When there is no private host
+// // (public server / editor) this returns true so the commands are usable for testing.
+// is_private_server_host :: proc(player: Player) -> bool {
+//     host_id, ok := Server.get_private_server_host_id();
+//     if !ok {
+//         return true;
+//     }
+//     return player.get_user_id() == host_id;
+// }
+
+// // Finds the connected private-server host, if any.
+// find_host_player :: proc() -> Player, bool {
+//     host_id, ok := Server.get_private_server_host_id();
+//     if !ok {
+//         return null, false;
+//     }
+//     for p: component_iterator(Player) {
+//         if p.get_user_id() == host_id {
+//             return p, true;
+//         }
+//     }
+//     return null, false;
+// }
+
+// // --- Ban storage ---
+
+// Ban_Record :: class {
+//     user_id: string @ao_serialize;  // Stable account id we match against on join.
+//     username: string @ao_serialize; // Human-readable name (for /unban and messages).
+// }
+
+// Ban_List :: class {
+//     bans: [..]Ban_Record @ao_serialize;
+// }
+
+// g_bans: Ban_List;          // Persistent bans (saved to the host's account).
+// g_session_bans: Ban_List;  // Session-only bans (in memory; cleared when the server restarts).
+
+// g_admin_initialized: bool = false; // Have we loaded the host's saved bans yet?
+// g_admin_tick: int = 0;             // Throttles the enforcement scan.
+
+// ensure_bans :: proc() {
+//     if g_bans == null {
+//         g_bans = new(Ban_List);
+//     }
+// }
+
+// ensure_session_bans :: proc() {
+//     if g_session_bans == null {
+//         g_session_bans = new(Ban_List);
+//     }
+// }
+
+// // Loads the host's saved (persistent) ban list into memory.
+// load_bans :: proc(host: Player) {
+//     if !Save.try_get_json(host, "private_bans", ref g_bans) {
+//         g_bans = new(Ban_List);
+//     }
+//     ensure_bans();
+// }
+
+// // Persists the in-memory persistent ban list back to the host's save.
+// save_bans :: proc(host: Player) {
+//     ensure_bans();
+//     Save.set_json(host, "private_bans", ref g_bans);
+// }
+
+// is_user_banned :: proc(user_id: string) -> bool {
+//     if g_bans == null {
+//         return false;
+//     }
+//     for b: g_bans.bans {
+//         if b.user_id == user_id {
+//             return true;
+//         }
+//     }
+//     return false;
+// }
+
+// is_user_session_banned :: proc(user_id: string) -> bool {
+//     if g_session_bans == null {
+//         return false;
+//     }
+//     for b: g_session_bans.bans {
+//         if b.user_id == user_id {
+//             return true;
+//         }
+//     }
+//     return false;
+// }
+
+// // True if a user is banned either persistently or for this session.
+// is_banned_any :: proc(user_id: string) -> bool {
+//     return is_user_banned(user_id) || is_user_session_banned(user_id);
+// }
+
+// // --- Enforcement (runs every frame, throttled) ---
+// // Lazily loads the host's saved bans once they're connected, then kicks any banned player.
+// // This catches both fresh joins and rejoins without needing a per-player join hook.
+// ao_update :: proc(dt: float) {
+//     g_admin_tick += 1;
+//     if g_admin_tick < 20 {
+//         return;
+//     }
+//     g_admin_tick = 0;
+
+//     if !g_admin_initialized {
+//         host, ok := find_host_player();
+//         if ok {
+//             load_bans(host);
+//             g_admin_initialized = true;
+//         }
+//     }
+
+//     for p: component_iterator(Player) {
+//         if is_banned_any(p.get_user_id()) {
+//             Server.kick_player(p, "You are banned from this server.");
+//         }
+//     }
+// }
+
+// // --- Commands (private server host only) ---
+
+// // Kicks a connected player by name. Usage: /kick "Player Name" ["reason"]
+// kick :: proc(player: Player, target: Player, reason: string = "Kicked by the host.") {
+//     if !is_private_server_host(player) {
+//         Notifier.notify(player, "Only the private server host can kick players.");
+//         return;
+//     }
+//     if target == null {
+//         Notifier.notify(player, "Couldn't find that player.");
+//         return;
+//     }
+//     if target == player {
+//         Notifier.notify(player, "You can't kick yourself.");
+//         return;
+//     }
+
+//     kicked_name := target.get_username();
+//     Server.kick_player(target, reason);
+//     Notifier.notify(player, format_string("Kicked %.", {kicked_name}));
+// } @chat_command @any
+
+// // Permanently bans a connected player: records them, saves to the host's account, kicks them.
+// // Usage: /ban "Player Name" ["reason"]
+// ban :: proc(player: Player, target: Player, reason: string = "Banned by the host.") {
+//     if !is_private_server_host(player) {
+//         Notifier.notify(player, "Only the private server host can ban players.");
+//         return;
+//     }
+//     if target == null {
+//         Notifier.notify(player, "Couldn't find that player.");
+//         return;
+//     }
+//     if target == player {
+//         Notifier.notify(player, "You can't ban yourself.");
+//         return;
+//     }
+
+//     ensure_bans();
+//     uid := target.get_user_id();
+//     if is_user_banned(uid) {
+//         Notifier.notify(player, format_string("% is already banned.", {target.get_username()}));
+//         return;
+//     }
+
+//     rec := new(Ban_Record);
+//     rec.user_id = uid;
+//     rec.username = target.get_username();
+//     append(ref g_bans.bans, rec);
+//     save_bans(player);
+
+//     Server.kick_player(target, reason);
+//     Notifier.notify(player, format_string("Banned %.", {rec.username}));
+// } @chat_command @any
+
+// // Removes a player from the persistent ban list by name. Usage: /unban "Player Name"
+// unban :: proc(player: Player, name: string = "") {
+//     if !is_private_server_host(player) {
+//         Notifier.notify(player, "Only the private server host can unban players.");
+//         return;
+//     }
+//     if name == "" {
+//         Notifier.notify(player, "Usage: /unban <player name>");
+//         return;
+//     }
+
+//     ensure_bans();
+//     wanted := to_lower(string_trim(name));
+//     removed := false;
+//     i := 0;
+//     while i < g_bans.bans.count {
+//         if to_lower(g_bans.bans[i].username) == wanted {
+//             g_bans.bans.ordered_remove_by_index(i);
+//             removed = true;
+//         } else {
+//             i += 1;
+//         }
+//     }
+
+//     if removed {
+//         save_bans(player);
+//         Notifier.notify(player, format_string("Unbanned %.", {name}));
+//     } else {
+//         Notifier.notify(player, format_string("No banned player named '%'.", {name}));
+//     }
+// } @chat_command @any
+
+// // Session-bans a connected player (kept only until the server restarts).
+// // Usage: /sessionban "Player Name" ["reason"]
+// sessionban :: proc(player: Player, target: Player, reason: string = "Banned for this session.") {
+//     if !is_private_server_host(player) {
+//         Notifier.notify(player, "Only the private server host can ban players.");
+//         return;
+//     }
+//     if target == null {
+//         Notifier.notify(player, "Couldn't find that player.");
+//         return;
+//     }
+//     if target == player {
+//         Notifier.notify(player, "You can't ban yourself.");
+//         return;
+//     }
+
+//     ensure_session_bans();
+//     uid := target.get_user_id();
+//     if is_user_session_banned(uid) {
+//         Notifier.notify(player, format_string("% is already session-banned.", {target.get_username()}));
+//         return;
+//     }
+
+//     rec := new(Ban_Record);
+//     rec.user_id = uid;
+//     rec.username = target.get_username();
+//     append(ref g_session_bans.bans, rec);
+
+//     Server.kick_player(target, reason);
+//     Notifier.notify(player, format_string("Session-banned % (until the server restarts).", {rec.username}));
+// } @chat_command @any
+
+// // Alias for /sessionban.
+// sban :: proc(player: Player, target: Player, reason: string = "Banned for this session.") {
+//     sessionban(player, target, reason);
+// } @chat_command @any
+
+// // Removes a session ban by name. Usage: /sessionunban "Player Name"
+// sessionunban :: proc(player: Player, name: string = "") {
+//     if !is_private_server_host(player) {
+//         Notifier.notify(player, "Only the private server host can unban players.");
+//         return;
+//     }
+//     if name == "" {
+//         Notifier.notify(player, "Usage: /sessionunban <player name>");
+//         return;
+//     }
+
+//     ensure_session_bans();
+//     wanted := to_lower(string_trim(name));
+//     removed := false;
+//     i := 0;
+//     while i < g_session_bans.bans.count {
+//         if to_lower(g_session_bans.bans[i].username) == wanted {
+//             g_session_bans.bans.ordered_remove_by_index(i);
+//             removed = true;
+//         } else {
+//             i += 1;
+//         }
+//     }
+
+//     if removed {
+//         Notifier.notify(player, format_string("Removed session ban for %.", {name}));
+//     } else {
+//         Notifier.notify(player, format_string("No session-banned player named '%'.", {name}));
+//     }
+// } @chat_command @any
+
+// // Alias for /sessionunban.
+// sunban :: proc(player: Player, name: string = "") {
+//     sessionunban(player, name);
+// } @chat_command @any
+
+// // Lists everyone currently banned (persistent + session). Usage: /banlist
+// banlist :: proc(player: Player) {
+//     if !is_private_server_host(player) {
+//         Notifier.notify(player, "Only the private server host can view the ban list.");
+//         return;
+//     }
+//     ensure_bans();
+//     ensure_session_bans();
+
+//     if g_bans.bans.count == 0 && g_session_bans.bans.count == 0 {
+//         Notifier.notify(player, "No one is banned.");
+//         return;
+//     }
+
+//     Notifier.notify(player, format_string("% permanent ban(s), % session ban(s).", {g_bans.bans.count, g_session_bans.bans.count}));
+//     for b: g_bans.bans {
+//         Notifier.notify(player, format_string("[perm] %", {b.username}));
+//     }
+//     for b: g_session_bans.bans {
+//         Notifier.notify(player, format_string("[session] %", {b.username}));
+//     }
+// } @chat_command @any
+
+// // Teleports another player to your position. Usage: /bring "Player Name"
+// bring :: proc(player: Player, target: Player) {
+//     if !is_private_server_host(player) {
+//         Notifier.notify(player, "Only the private server host can bring players.");
+//         return;
+//     }
+//     if target == null {
+//         Notifier.notify(player, "Couldn't find that player.");
+//         return;
+//     }
+//     if target == player {
+//         Notifier.notify(player, "You're already here.");
+//         return;
+//     }
+
+//     target.entity.set_local_position(player.entity.world_position);
+//     Notifier.notify(player, format_string("Brought % to you.", {target.get_username()}));
+//     Notifier.notify(target, format_string("You were brought to %.", {player.get_username()}));
+// } @chat_command @any
+
+// // Broadcasts a server message to everyone in chat. Usage: /announce <message>
+// announce :: proc(player: Player, message: string = "") {
+//     if !is_private_server_host(player) {
+//         Notifier.notify(player, "Only the private server host can make announcements.");
+//         return;
+//     }
+//     if message == "" {
+//         Notifier.notify(player, "Usage: /announce <message>");
+//         return;
+//     }
+//     Chat.server_send_message(format_string("[Announcement] %", {message}));
+// } @chat_command @any

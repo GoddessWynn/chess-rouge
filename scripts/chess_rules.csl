@@ -1,0 +1,493 @@
+// Pure board-model chess logic used for check / checkmate detection and for filtering
+// out moves that would leave your own king in check. This is independent of the
+// entity/highlight system: it works on an 8x8 snapshot of piece types + colours.
+
+// One square of the board is identified by (file, rank), both 1..8.
+// The snapshot stores them flattened: index = (file-1) + (rank-1)*8, range 0..63.
+Chess_Board :: struct {
+    piece:  [64]string; // "" = empty, otherwise "Pawn".."King".
+    colour: [64]string; // "" = empty, otherwise "White"/"Black".
+    moved:  [64]bool;   // has_moved for the piece on each square (used for AI castling).
+}
+
+// A candidate destination square for a piece (used when enumerating moves).
+Chess_Move :: struct {
+    file: int;
+    rank: int;
+    victim_file: int; // En passant only: square of the captured pawn (0 = none).
+    victim_rank: int;
+}
+
+// --- small integer helpers (the built-in math funcs target floats) ---
+abs_int :: proc(x: int) -> int {
+    if x < 0 {
+        return -x;
+    }
+    return x;
+}
+
+max_int :: proc(a: int, b: int) -> int {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+chess_sign :: proc(x: int) -> int {
+    if x > 0 {
+        return 1;
+    }
+    if x < 0 {
+        return -1;
+    }
+    return 0;
+}
+
+chess_index :: proc(file: int, rank: int) -> int {
+    return (file - 1) + (rank - 1) * 8;
+}
+
+chess_on_board :: proc(file: int, rank: int) -> bool {
+    return file >= 1 && file <= 8 && rank >= 1 && rank <= 8;
+}
+
+// The opposing colour.
+chess_enemy_colour :: proc(colour: string) -> string {
+    if colour == "White" {
+        return "Black";
+    }
+    return "White";
+}
+
+// Builds a board snapshot from the live pieces in the scene. Pieces being dragged
+// off-grid are simply omitted (their file/rank won't be a valid square).
+chess_build_board :: proc() -> Chess_Board {
+    board: Chess_Board;
+    for ce: component_iterator(Controllable_Entity) {
+        // Captured pieces are parked off-board; ignore them.
+        if ce.captured {
+            continue;
+        }
+        f := 0;
+        r := 0;
+        ce.get_board_file_rank(ref f, ref r);
+        if chess_on_board(f, r) {
+            idx := chess_index(f, r);
+            board.piece[idx] = ce.piece;
+            board.colour[idx] = ce.colour;
+            board.moved[idx] = ce.has_moved;
+        }
+    }
+    return board;
+}
+
+// True if every square strictly between (af,ar) and (tf,tr) is empty.
+// Assumes the two points lie on a straight or diagonal line.
+chess_path_clear :: proc(board: Chess_Board, af: int, ar: int, tf: int, tr: int) -> bool {
+    sf := chess_sign(tf - af);
+    sr := chess_sign(tr - ar);
+    cf := af + sf;
+    cr := ar + sr;
+    while cf != tf || cr != tr {
+        if !chess_on_board(cf, cr) {
+            return false;
+        }
+        if board.piece[chess_index(cf, cr)] != "" {
+            return false;
+        }
+        cf += sf;
+        cr += sr;
+    }
+    return true;
+}
+
+// True if the piece of `colour` at (af,ar) attacks square (tf,tr).
+chess_piece_attacks :: proc(board: Chess_Board, af: int, ar: int, piece: string, colour: string, tf: int, tr: int) -> bool {
+    df := tf - af;
+    dr := tr - ar;
+
+    if piece == "Pawn" {
+        // Pawns attack only the two forward diagonals.
+        forward := 1;
+        if colour == "Black" {
+            forward = -1;
+        }
+        return dr == forward && (df == 1 || df == -1);
+    } else if piece == "Knight" {
+        adf := abs_int(df);
+        adr := abs_int(dr);
+        return (adf == 1 && adr == 2) || (adf == 2 && adr == 1);
+    } else if piece == "King" {
+        return max_int(abs_int(df), abs_int(dr)) == 1;
+    } else if piece == "Rook" {
+        if df != 0 && dr != 0 {
+            return false;
+        }
+        return chess_path_clear(board, af, ar, tf, tr);
+    } else if piece == "Bishop" {
+        if abs_int(df) != abs_int(dr) {
+            return false;
+        }
+        return chess_path_clear(board, af, ar, tf, tr);
+    } else if piece == "Queen" {
+        if df == 0 || dr == 0 {
+            return chess_path_clear(board, af, ar, tf, tr);
+        }
+        if abs_int(df) == abs_int(dr) {
+            return chess_path_clear(board, af, ar, tf, tr);
+        }
+        return false;
+    }
+
+    return false;
+}
+
+// True if any piece of `by_colour` attacks square (tf,tr).
+chess_is_square_attacked :: proc(board: Chess_Board, tf: int, tr: int, by_colour: string) -> bool {
+    f := 1;
+    while f <= 8 {
+        r := 1;
+        while r <= 8 {
+            idx := chess_index(f, r);
+            if board.piece[idx] != "" && board.colour[idx] == by_colour {
+                if chess_piece_attacks(board, f, r, board.piece[idx], by_colour, tf, tr) {
+                    return true;
+                }
+            }
+            r += 1;
+        }
+        f += 1;
+    }
+    return false;
+}
+
+// Locates the king of `colour`. Returns false if there isn't one.
+chess_find_king :: proc(board: Chess_Board, colour: string, out_file: ref int, out_rank: ref int) -> bool {
+    f := 1;
+    while f <= 8 {
+        r := 1;
+        while r <= 8 {
+            idx := chess_index(f, r);
+            if board.piece[idx] == "King" && board.colour[idx] == colour {
+                out_file = f;
+                out_rank = r;
+                return true;
+            }
+            r += 1;
+        }
+        f += 1;
+    }
+    return false;
+}
+
+// True if `colour`'s king is currently under attack.
+chess_is_in_check :: proc(board: Chess_Board, colour: string) -> bool {
+    kf := 0;
+    kr := 0;
+    if !chess_find_king(board, colour, ref kf, ref kr) {
+        return false;
+    }
+    return chess_is_square_attacked(board, kf, kr, chess_enemy_colour(colour));
+}
+
+// Returns a copy of `board` with the piece at (ff,fr) moved to (tf,tr), capturing
+// anything on the destination. If (vf,vr) is non-zero, that square is also cleared
+// (used for en passant, where the captured pawn isn't on the destination square).
+chess_board_after_move :: proc(board: Chess_Board, ff: int, fr: int, tf: int, tr: int, vf: int, vr: int) -> Chess_Board {
+    if vf != 0 {
+        vidx := chess_index(vf, vr);
+        board.piece[vidx] = "";
+        board.colour[vidx] = "";
+    }
+    from_idx := chess_index(ff, fr);
+    to_idx := chess_index(tf, tr);
+    board.piece[to_idx] = board.piece[from_idx];
+    board.colour[to_idx] = board.colour[from_idx];
+    board.piece[from_idx] = "";
+    board.colour[from_idx] = "";
+    return board;
+}
+
+// Appends a destination square to a move list.
+chess_add_move :: proc(out: ref [..]Chess_Move, f: int, r: int) {
+    append(ref out, Chess_Move{f, r, 0, 0});
+}
+
+// Appends an en passant move, recording the captured pawn's square so the simulation
+// can remove it when testing whether the move escapes check.
+chess_add_ep_move :: proc(out: ref [..]Chess_Move, f: int, r: int, vf: int, vr: int) {
+    append(ref out, Chess_Move{f, r, vf, vr});
+}
+
+// Adds a single-step destination (knight/king) if it's empty or holds an enemy.
+chess_try_step :: proc(board: Chess_Board, colour: string, f: int, r: int, out: ref [..]Chess_Move) {
+    if !chess_on_board(f, r) {
+        return;
+    }
+    idx := chess_index(f, r);
+    if board.piece[idx] == "" || board.colour[idx] != colour {
+        chess_add_move(ref out, f, r);
+    }
+}
+
+// Adds sliding destinations (rook/bishop/queen) along (df,dr) until blocked.
+chess_slide :: proc(board: Chess_Board, colour: string, f: int, r: int, df: int, dr: int, out: ref [..]Chess_Move) {
+    cf := f + df;
+    cr := r + dr;
+    while chess_on_board(cf, cr) {
+        idx := chess_index(cf, cr);
+        if board.piece[idx] == "" {
+            chess_add_move(ref out, cf, cr);
+        } else {
+            if board.colour[idx] != colour {
+                chess_add_move(ref out, cf, cr);
+            }
+            break;
+        }
+        cf += df;
+        cr += dr;
+    }
+}
+
+// Adds a pawn diagonal capture if an enemy sits there.
+chess_pawn_capture :: proc(board: Chess_Board, tf: int, tr: int, colour: string, out: ref [..]Chess_Move) {
+    if !chess_on_board(tf, tr) {
+        return;
+    }
+    idx := chess_index(tf, tr);
+    if board.piece[idx] != "" && board.colour[idx] != colour {
+        chess_add_move(ref out, tf, tr);
+    }
+}
+
+// Enumerates pseudo-legal destinations for the piece at (f,r). Used only for the
+// "is there any move out of check?" test, so castling and en passant are omitted
+// (they're vanishingly rare as the sole escape from check).
+chess_generate_moves :: proc(board: Chess_Board, f: int, r: int, out: ref [..]Chess_Move) {
+    idx := chess_index(f, r);
+    piece := board.piece[idx];
+    colour := board.colour[idx];
+    if piece == "" {
+        return;
+    }
+
+    if piece == "Pawn" {
+        forward := 1;
+        start_rank := 2;
+        if colour == "Black" {
+            forward = -1;
+            start_rank = 7;
+        }
+        if chess_on_board(f, r + forward) && board.piece[chess_index(f, r + forward)] == "" {
+            chess_add_move(ref out, f, r + forward);
+            if r == start_rank && board.piece[chess_index(f, r + forward * 2)] == "" {
+                chess_add_move(ref out, f, r + forward * 2);
+            }
+        }
+        chess_pawn_capture(board, f - 1, r + forward, colour, ref out);
+        chess_pawn_capture(board, f + 1, r + forward, colour, ref out);
+        // En passant capture (so it counts as a way out of check).
+        if has_en_passant() && en_passant_target_rank == r + forward && abs_int(en_passant_target_file - f) == 1 {
+            if chess_on_board(en_passant_victim_file, en_passant_victim_rank) {
+                vidx := chess_index(en_passant_victim_file, en_passant_victim_rank);
+                if board.piece[vidx] == "Pawn" && board.colour[vidx] != colour {
+                    chess_add_ep_move(ref out, en_passant_target_file, en_passant_target_rank, en_passant_victim_file, en_passant_victim_rank);
+                }
+            }
+        }
+    } else if piece == "Knight" {
+        chess_try_step(board, colour, f + 1, r + 2, ref out);
+        chess_try_step(board, colour, f + 2, r + 1, ref out);
+        chess_try_step(board, colour, f + 2, r - 1, ref out);
+        chess_try_step(board, colour, f + 1, r - 2, ref out);
+        chess_try_step(board, colour, f - 1, r - 2, ref out);
+        chess_try_step(board, colour, f - 2, r - 1, ref out);
+        chess_try_step(board, colour, f - 2, r + 1, ref out);
+        chess_try_step(board, colour, f - 1, r + 2, ref out);
+    } else if piece == "King" {
+        chess_try_step(board, colour, f + 1, r, ref out);
+        chess_try_step(board, colour, f - 1, r, ref out);
+        chess_try_step(board, colour, f, r + 1, ref out);
+        chess_try_step(board, colour, f, r - 1, ref out);
+        chess_try_step(board, colour, f + 1, r + 1, ref out);
+        chess_try_step(board, colour, f + 1, r - 1, ref out);
+        chess_try_step(board, colour, f - 1, r + 1, ref out);
+        chess_try_step(board, colour, f - 1, r - 1, ref out);
+    } else if piece == "Rook" {
+        chess_slide(board, colour, f, r, 1, 0, ref out);
+        chess_slide(board, colour, f, r, -1, 0, ref out);
+        chess_slide(board, colour, f, r, 0, 1, ref out);
+        chess_slide(board, colour, f, r, 0, -1, ref out);
+    } else if piece == "Bishop" {
+        chess_slide(board, colour, f, r, 1, 1, ref out);
+        chess_slide(board, colour, f, r, 1, -1, ref out);
+        chess_slide(board, colour, f, r, -1, 1, ref out);
+        chess_slide(board, colour, f, r, -1, -1, ref out);
+    } else if piece == "Queen" {
+        chess_slide(board, colour, f, r, 1, 0, ref out);
+        chess_slide(board, colour, f, r, -1, 0, ref out);
+        chess_slide(board, colour, f, r, 0, 1, ref out);
+        chess_slide(board, colour, f, r, 0, -1, ref out);
+        chess_slide(board, colour, f, r, 1, 1, ref out);
+        chess_slide(board, colour, f, r, 1, -1, ref out);
+        chess_slide(board, colour, f, r, -1, 1, ref out);
+        chess_slide(board, colour, f, r, -1, -1, ref out);
+    }
+}
+
+// True if `colour` has at least one move that does NOT leave their own king in check.
+chess_has_any_legal_move :: proc(board: Chess_Board, colour: string) -> bool {
+    f := 1;
+    while f <= 8 {
+        r := 1;
+        while r <= 8 {
+            idx := chess_index(f, r);
+            if board.piece[idx] != "" && board.colour[idx] == colour {
+                moves: [..]Chess_Move;
+                chess_generate_moves(board, f, r, ref moves);
+                for m: moves {
+                    after := chess_board_after_move(board, f, r, m.file, m.rank, m.victim_file, m.victim_rank);
+                    if !chess_is_in_check(after, colour) {
+                        return true;
+                    }
+                }
+            }
+            r += 1;
+        }
+        f += 1;
+    }
+    return false;
+}
+
+// True if `colour` is in check and has no move to escape it.
+chess_is_checkmate :: proc(board: Chess_Board, colour: string) -> bool {
+    if !chess_is_in_check(board, colour) {
+        return false;
+    }
+    return !chess_has_any_legal_move(board, colour);
+}
+
+// --- Draw helpers ---
+
+// 0 if n is even, 1 if odd (used for bishop square colour).
+chess_parity :: proc(n: int) -> int {
+    return n - (n / 2) * 2;
+}
+
+// True if neither side has enough material to ever checkmate: K vs K, K + single minor
+// vs K, or K+B vs K+B with both bishops on the same colour squares.
+chess_is_insufficient_material :: proc(board: Chess_Board) -> bool {
+    white_bishops := 0;
+    white_knights := 0;
+    black_bishops := 0;
+    black_knights := 0;
+    white_bishop_parity := 0;
+    black_bishop_parity := 0;
+
+    f := 1;
+    while f <= 8 {
+        r := 1;
+        while r <= 8 {
+            idx := chess_index(f, r);
+            p := board.piece[idx];
+            if p != "" && p != "King" {
+                // Any pawn, rook, or queen means checkmate is still possible.
+                if p == "Pawn" || p == "Rook" || p == "Queen" {
+                    return false;
+                }
+                par := chess_parity(f + r);
+                if board.colour[idx] == "White" {
+                    if p == "Bishop" {
+                        white_bishops += 1;
+                        white_bishop_parity = par;
+                    } else {
+                        white_knights += 1;
+                    }
+                } else {
+                    if p == "Bishop" {
+                        black_bishops += 1;
+                        black_bishop_parity = par;
+                    } else {
+                        black_knights += 1;
+                    }
+                }
+            }
+            r += 1;
+        }
+        f += 1;
+    }
+
+    white_minors := white_bishops + white_knights;
+    black_minors := black_bishops + black_knights;
+
+    if white_minors == 0 && black_minors == 0 {
+        return true; // K vs K
+    }
+    if white_minors <= 1 && black_minors == 0 {
+        return true; // K + minor vs K
+    }
+    if black_minors <= 1 && white_minors == 0 {
+        return true; // K vs K + minor
+    }
+    if white_bishops == 1 && black_bishops == 1 && white_knights == 0 && black_knights == 0 {
+        if white_bishop_parity == black_bishop_parity {
+            return true; // K+B vs K+B, same colour bishops
+        }
+    }
+    return false;
+}
+
+// Distinct letter for each piece type (Knight = N, King = K).
+chess_piece_letter :: proc(piece: string) -> string {
+    if piece == "Pawn" {
+        return "P";
+    }
+    if piece == "Rook" {
+        return "R";
+    }
+    if piece == "Knight" {
+        return "N";
+    }
+    if piece == "Bishop" {
+        return "B";
+    }
+    if piece == "Queen" {
+        return "Q";
+    }
+    if piece == "King" {
+        return "K";
+    }
+    return "?";
+}
+
+// A short code for one square (colour + piece), used to build a position signature.
+chess_square_code :: proc(piece: string, colour: string) -> string {
+    if piece == "" {
+        return ".";
+    }
+    cc := "w";
+    if colour == "Black" {
+        cc = "b";
+    }
+    return format_string("%%", {cc, chess_piece_letter(piece)});
+}
+
+// Builds a string that identifies the current position (piece layout + side to move +
+// en passant target), used to detect threefold repetition. Castling rights are not
+// encoded, so repetition is approximate in rare castling-rights-only cases.
+chess_position_signature :: proc() -> string {
+    board := chess_build_board();
+    sig := get_turn_name();
+    f := 1;
+    while f <= 8 {
+        r := 1;
+        while r <= 8 {
+            idx := chess_index(f, r);
+            sig = format_string("%%", {sig, chess_square_code(board.piece[idx], board.colour[idx])});
+            r += 1;
+        }
+        f += 1;
+    }
+    sig = format_string("%|%|%", {sig, en_passant_target_file, en_passant_target_rank});
+    return sig;
+}
